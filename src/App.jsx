@@ -22,7 +22,8 @@ function freshGame() {
     turnStartedAt: 0,          // timestamp when turn started (clients compute countdown)
     skipsUsed: 0,
     wordsSubmitted: {},
-    adminName: null,
+    wordLog: [],              // audit trail: word + player + result + round
+    adminName: null,          // monitor/admin only — not a player
     ver: 0,
   };
 }
@@ -53,6 +54,47 @@ const F = {
 const FONT_LINK = "https://fonts.googleapis.com/css2?family=Righteous&family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
 
 // ─── UI Components ───
+function RoundWordAudit({ logs, round, title }) {
+  const roundLogs = (logs || []).filter(l => l.round === round);
+  const groups = [
+    { key: "skipped", label: "Skipped", color: C.warn },
+    { key: "approved", label: "Rohan Approved", color: C.success },
+    { key: "disapproved", label: "Rohan Disapproved", color: C.danger },
+  ];
+  return (
+    <Card style={{ marginTop: 14, textAlign: "left" }}>
+      <h3 style={{ fontFamily: F.display, textAlign: "center", color: C.accent3, margin: "0 0 14px" }}>{title || `Round ${round + 1} Word Log`}</h3>
+      {groups.map(group => {
+        const items = roundLogs.filter(l => l.result === group.key);
+        return (
+          <div key={group.key} style={{ marginBottom: 14 }}>
+            <div style={{ fontFamily: F.display, color: group.color, fontSize: 14, marginBottom: 6 }}>{group.label}</div>
+            {items.length === 0 ? (
+              <div style={{ color: C.muted, fontSize: 12, background: C.surface, borderRadius: 8, padding: "8px 10px" }}>None</div>
+            ) : items.map((item, idx) => (
+              <div key={`${item.word}-${item.playerName}-${idx}`} style={{ display: "flex", justifyContent: "space-between", gap: 10, background: C.surface, borderRadius: 8, padding: "8px 10px", marginBottom: 5, fontSize: 13 }}>
+                <span style={{ color: C.text, fontWeight: 700 }}>{item.word}</span>
+                <span style={{ color: C.muted, textAlign: "right" }}>played by {item.playerName} · {item.teamName}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </Card>
+  );
+}
+
+function FullGameAudit({ logs }) {
+  return (
+    <div style={{ marginTop: 14 }}>
+      {[...Array(NUM_ROUNDS)].map((_, r) => {
+        const hasLogs = (logs || []).some(l => l.round === r);
+        return hasLogs ? <RoundWordAudit key={r} logs={logs} round={r} title={`Round ${r + 1} Word Log`} /> : null;
+      })}
+    </div>
+  );
+}
+
 function Btn({ children, onClick, color = C.accent, disabled, style }) {
   return (
     <button onClick={onClick} disabled={disabled} style={{
@@ -179,16 +221,16 @@ export default function App() {
       const remaining = Math.max(0, (g.settings?.timePerTurn || 30) - elapsed);
       setLocalTime(remaining);
 
-      // Current player auto-ends their own turn when time hits 0.
-      // Any word still showing with no button pressed remains in roundWords,
-      // then the remaining words are reshuffled before the next turn.
-      const activeTurn = (g.turnOrder || [])[g.currentTurnIdx || 0];
-      if (remaining <= 0 && activeTurn?.playerName === myNameRef.current) {
+      // Current player or monitor-admin auto-ends turn when time hits 0.
+      // The current word stays in play, but remaining words reshuffle before next turn.
+      const current = (g.turnOrder || [])[g.currentTurnIdx || 0];
+      const canEnd = current?.playerName === myNameRef.current || g.adminName === myNameRef.current;
+      if (remaining <= 0 && canEnd) {
         const ng = {
           ...g,
-          roundWords: shuffle(g.roundWords || []),
           turnActive: false,
           turnStartedAt: 0,
+          roundWords: shuffle(g.roundWords || []),
           currentTurnIdx: (g.currentTurnIdx || 0) + 1,
           skipsUsed: 0,
           ver: (g.ver || 0) + 1,
@@ -198,7 +240,7 @@ export default function App() {
         setLocalTime(g.settings?.timePerTurn || 30);
         saveGame(ng);
       }
-    }, 250); // tick 4x/sec for smooth display, but only admin writes on 0
+    }, 250); // tick 4x/sec for smooth display
     return () => clearInterval(id);
   }, []);
 
@@ -208,6 +250,7 @@ export default function App() {
   const roundWords = game.roundWords || [];
   const currentWord = roundWords[0] || null;  // ALWAYS first element
   const isMyTurn = currentTurn && currentTurn.playerName === myName;
+  const amAdmin = myName === game.adminName;
   const players = game.allPlayers || [];
   const submitted = game.wordsSubmitted || {};
   const submittedCount = Object.keys(submitted).length;
@@ -218,7 +261,7 @@ export default function App() {
     if (!inputName.trim()) return;
     const g = freshGame();
     g.adminName = inputName.trim();
-    g.allPlayers = [inputName.trim()];
+    g.allPlayers = [];
     g.settings.timePerTurn = timeOption;
     g.team1.name = team1Name;
     g.team2.name = team2Name;
@@ -234,12 +277,15 @@ export default function App() {
     const g = gRef.current;
     if (!g.adminName) return alert("No game found! Ask the admin to create one first.");
     const name = inputName.trim();
-    if ((g.allPlayers || []).includes(name)) {
-      setMyName(name); setJoined(true);
-      if (g.adminName === name) setIsAdmin(true);
+    if (g.adminName === name) {
+      setMyName(name); setIsAdmin(true); setJoined(true);
       return;
     }
-    setMyName(name); setJoined(true);
+    if ((g.allPlayers || []).includes(name)) {
+      setMyName(name); setIsAdmin(false); setJoined(true);
+      return;
+    }
+    setMyName(name); setIsAdmin(false); setJoined(true);
     await patch({ allPlayers: [...(g.allPlayers || []), name] });
   };
 
@@ -298,6 +344,7 @@ export default function App() {
       turnOrder: buildTurnOrder(t1p, t2p),
       currentTurnIdx: 0,
       turnActive: false, turnStartedAt: 0, skipsUsed: 0,
+      wordLog: [],
     });
     setLocalTime(g.settings.timePerTurn);
   };
@@ -306,13 +353,23 @@ export default function App() {
     const g = gRef.current;
     setLocalTime(g.settings.timePerTurn);
     await patch({
-      // Safety reshuffle before every turn starts, so nobody inherits
-      // the exact last visible word from the previous turn.
       roundWords: shuffle(g.roundWords || []),
       turnActive: true,
       turnStartedAt: Date.now(),
       skipsUsed: 0,
     });
+  };
+
+  const auditEntry = (g, result) => {
+    const turn = (g.turnOrder || [])[g.currentTurnIdx || 0] || {};
+    return {
+      round: g.currentRound || 0,
+      word: (g.roundWords || [])[0],
+      result,
+      playerName: turn.playerName || "Unknown",
+      team: turn.team || null,
+      teamName: turn.team === 1 ? g.team1.name : g.team2.name,
+    };
   };
 
   // Remove word from front of roundWords, check if round ends
@@ -332,10 +389,12 @@ export default function App() {
     const { rw, phaseUpdate, roundDone } = removeCurrentWord(g);
     await patch({
       [tk]: { ...g[tk], score: (g[tk].score || 0) + 2 },
+      wordLog: [...(g.wordLog || []), auditEntry(g, "approved")],
       roundWords: rw,
       phase: phaseUpdate,
       turnActive: roundDone ? false : g.turnActive,
       turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+      currentTurnIdx: roundDone ? (g.currentTurnIdx || 0) + 1 : g.currentTurnIdx,
     });
   };
 
@@ -348,11 +407,13 @@ export default function App() {
     const scoreDelta = skips < 2 ? 0 : -1;
     await patch({
       [tk]: { ...g[tk], score: (g[tk].score || 0) + scoreDelta },
+      wordLog: [...(g.wordLog || []), auditEntry(g, "skipped")],
       roundWords: rw,
       skipsUsed: skips + 1,
       phase: phaseUpdate,
       turnActive: roundDone ? false : g.turnActive,
       turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+      currentTurnIdx: roundDone ? (g.currentTurnIdx || 0) + 1 : g.currentTurnIdx,
     });
   };
 
@@ -361,10 +422,12 @@ export default function App() {
     if (!currentWord) return;
     const { rw, phaseUpdate, roundDone } = removeCurrentWord(g);
     await patch({
+      wordLog: [...(g.wordLog || []), auditEntry(g, "disapproved")],
       roundWords: rw,
       phase: phaseUpdate,
       turnActive: roundDone ? false : g.turnActive,
       turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+      currentTurnIdx: roundDone ? (g.currentTurnIdx || 0) + 1 : g.currentTurnIdx,
     });
   };
 
@@ -455,11 +518,14 @@ export default function App() {
           <Card style={{animation:"fadeIn .4s ease"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
               <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings?.timePerTurn || 30}s turns</h3>
-              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} joined</span>
+              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} players joined</span>
             </div>
             <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:18}}>
+              {game.adminName && (
+                <span style={{background:C.accent+"33",border:`1px solid ${C.accent}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:game.adminName===myName?C.accent3:C.text,fontWeight:700}}>{game.adminName} 👑 Monitor Admin{game.adminName===myName?" (you)":""}</span>
+              )}
               {players.map(p=>(
-                <span key={p} style={{background:p===game.adminName?C.accent+"33":C.surface,border:`1px solid ${p===game.adminName?C.accent:C.border}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:p===myName?C.accent3:C.text,fontWeight:p===myName?700:400}}>{p}{p===game.adminName?" 👑":""}{p===myName?" (you)":""}</span>
+                <span key={p} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:p===myName?C.accent3:C.text,fontWeight:p===myName?700:400}}>{p}{p===myName?" (you)":""}</span>
               ))}
             </div>
             {isAdmin && (<>
@@ -502,7 +568,13 @@ export default function App() {
           <Card style={{animation:"fadeIn .4s ease"}}>
             <h3 style={{fontFamily:F.display,textAlign:"center",color:C.accent3,margin:"0 0 2px"}}>🎉 Words for Rohan</h3>
             <p style={{textAlign:"center",color:C.muted,fontSize:13,marginBottom:18}}>Enter 3 words or phrases about the birthday boy!</p>
-            {submitted[myName] ? (
+            {isAdmin ? (
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:38,marginBottom:6}}>👑</div>
+                <p style={{color:C.accent3,fontWeight:600,margin:"0 0 4px"}}>Monitor admin mode</p>
+                <p style={{color:C.muted,fontSize:13}}>{submittedCount} / {players.length} players done</p>
+              </div>
+            ) : submitted[myName] ? (
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:38,marginBottom:6}}>✅</div>
                 <p style={{color:C.success,fontWeight:600,margin:"0 0 4px"}}>Words submitted!</p>
@@ -552,7 +624,7 @@ export default function App() {
               </div>
 
               {/* Word card — always roundWords[0] */}
-              {game.turnActive && isMyTurn && currentWord && (
+              {game.turnActive && (isMyTurn||amAdmin) && currentWord && (
                 <div style={{background:`linear-gradient(135deg,${C.accent}22,${C.accent2}22)`,borderRadius:14,padding:"24px 18px",marginBottom:14,border:`2px solid ${C.accent}55`,animation:"fadeIn .3s ease"}}>
                   <div style={{fontSize:11,color:C.muted,marginBottom:5}}>THE WORD IS</div>
                   <div style={{fontFamily:F.display,fontSize:28,color:C.gold,textShadow:`0 0 18px ${C.gold}44`}}>{currentWord}</div>
@@ -560,7 +632,7 @@ export default function App() {
               )}
 
               {/* Waiting for other player */}
-              {game.turnActive && !isMyTurn && (
+              {game.turnActive && !isMyTurn && !amAdmin && (
                 <div style={{background:C.surface,borderRadius:14,padding:"24px 18px",marginBottom:14}}>
                   <div style={{fontSize:36,marginBottom:6}}>👀</div>
                   <div style={{color:C.muted}}>{currentTurn?.playerName} is playing...</div>
@@ -568,12 +640,12 @@ export default function App() {
               )}
 
               {/* Start turn button */}
-              {!game.turnActive && isMyTurn && (
-                <Btn onClick={startTurn}>Start My Turn!</Btn>
+              {!game.turnActive && (isMyTurn||amAdmin) && (
+                <Btn onClick={startTurn}>{isMyTurn?"Start My Turn!":`Start ${currentTurn?.playerName}'s Turn`}</Btn>
               )}
 
               {/* Action buttons */}
-              {game.turnActive && isMyTurn && (
+              {game.turnActive && (isMyTurn||amAdmin) && (
                 <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
                   <Btn onClick={handleCorrect} color={C.success} disabled={busy}>✓ Rohan Approves (+2)</Btn>
                   <Btn onClick={handleSkip} color={C.warn} disabled={busy}>⏭ Skip {(game.skipsUsed||0)>=2?"(-1)":`(${2-(game.skipsUsed||0)} free)`}</Btn>
@@ -591,6 +663,7 @@ export default function App() {
             <h2 style={{fontFamily:F.display,color:C.gold,margin:"0 0 6px"}}>Round {(game.currentRound||0)+1} Complete!</h2>
             <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(NUM_ROUNDS-1)-(game.currentRound||0)} round{(NUM_ROUNDS-1)-(game.currentRound||0)!==1?"s":""} left.</p>
             <Scoreboard team1={game.team1} team2={game.team2} />
+            <RoundWordAudit logs={game.wordLog || []} round={game.currentRound || 0} />
             {isAdmin && (game.currentRound||0)<(NUM_ROUNDS-1) && (
               <Btn onClick={nextRound} style={{marginTop:18}}>Start Round {(game.currentRound||0)+2}</Btn>
             )}
@@ -618,6 +691,7 @@ export default function App() {
                   <div style={{fontFamily:F.display,fontSize:14,color:C.danger,marginTop:10,opacity:0.8}}>{loser} — Rohan is disappointed in you.</div>
                 </div>
               )}
+              <FullGameAudit logs={game.wordLog || []} />
               {isAdmin && <Btn onClick={resetGame} color={C.muted} style={{marginTop:18}}>Reset Game</Btn>}
             </Card>
           );
