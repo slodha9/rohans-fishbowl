@@ -2,14 +2,14 @@ import { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { saveGame, onGameUpdate } from "./firebase.js";
 
 // ─── Constants ───
-const NUM_ROUNDS = 4;
+const DEFAULT_NUM_ROUNDS = 4;
 const FISH = "🐟";
 const TROPHY = "🏆";
 
 function freshGame() {
   return {
     phase: "lobby",            // lobby | teams | words | playing | roundEnd | gameOver
-    settings: { timePerTurn: 30 },
+    settings: { timePerTurn: 30, numRounds: DEFAULT_NUM_ROUNDS },
     team1: { name: "Team Shark 🦈", players: [], score: 0 },
     team2: { name: "Team Whale 🐋", players: [], score: 0 },
     allPlayers: [],
@@ -84,10 +84,10 @@ function RoundWordAudit({ logs, round, title }) {
   );
 }
 
-function FullGameAudit({ logs }) {
+function FullGameAudit({ logs, totalRounds = DEFAULT_NUM_ROUNDS }) {
   return (
     <div style={{ marginTop: 14 }}>
-      {[...Array(NUM_ROUNDS)].map((_, r) => {
+      {[...Array(totalRounds)].map((_, r) => {
         const hasLogs = (logs || []).some(l => l.round === r);
         return hasLogs ? <RoundWordAudit key={r} logs={logs} round={r} title={`Round ${r + 1} Word Log`} /> : null;
       })}
@@ -147,13 +147,34 @@ function Scoreboard({ team1, team2 }) {
   );
 }
 
-function RoundBadge({ round }) {
+function RoundBadge({ round, totalRounds }) {
   return (
     <div style={{
       display: "inline-flex", alignItems: "center", gap: 8,
       background: `linear-gradient(90deg, ${C.accent}, ${C.accent2})`,
       borderRadius: 20, padding: "6px 18px", fontFamily: F.display, fontSize: 14, color: "#fff",
-    }}>Round {round + 1} of {NUM_ROUNDS}</div>
+    }}>Round {round + 1} of {totalRounds}</div>
+  );
+}
+
+function TurnOrderPreview({ order, team1, team2 }) {
+  if (!order || order.length === 0) return null;
+  const cycleSize = Math.max(1, (team1.players || []).length + (team2.players || []).length);
+  const preview = order.slice(0, Math.min(order.length, cycleSize * 2));
+  return (
+    <Card style={{ marginTop: 14 }}>
+      <h3 style={{fontFamily:F.display,textAlign:"center",color:C.accent3,margin:"0 0 10px"}}>Fixed Playing Order</h3>
+      <div style={{ color: C.muted, fontSize: 12, textAlign: "center", marginBottom: 12 }}>This sequence repeats as rounds continue.</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {preview.map((turn, idx) => (
+          <div key={`${turn.playerName}-${idx}`} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,background:C.surface,borderRadius:9,padding:"8px 10px",fontSize:13}}>
+            <span style={{fontFamily:F.mono,color:C.muted}}>#{idx + 1}</span>
+            <span style={{flex:1,color:C.text,fontWeight:700}}>{turn.playerName}</span>
+            <span style={{color:turn.team===1?C.accent:C.accent2}}>{turn.team===1?team1.name:team2.name}</span>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
@@ -175,6 +196,7 @@ export default function App() {
   const [team1Name, setTeam1Name] = useState("Team Shark 🦈");
   const [team2Name, setTeam2Name] = useState("Team Whale 🐋");
   const [timeOption, setTimeOption] = useState(30);
+  const [roundOption, setRoundOption] = useState(DEFAULT_NUM_ROUNDS);
   const [localTime, setLocalTime] = useState(30);  // LOCAL timer display
   const [busy, setBusy] = useState(false);          // prevent double-clicks
   const myNameRef = useRef("");
@@ -254,6 +276,7 @@ export default function App() {
   const players = game.allPlayers || [];
   const submitted = game.wordsSubmitted || {};
   const submittedCount = Object.keys(submitted).length;
+  const totalRounds = game.settings?.numRounds || DEFAULT_NUM_ROUNDS;
 
   // ══════════ HANDLERS (each writes to Firebase exactly once) ══════════
 
@@ -263,6 +286,7 @@ export default function App() {
     g.adminName = inputName.trim();
     g.allPlayers = [];
     g.settings.timePerTurn = timeOption;
+    g.settings.numRounds = roundOption;
     g.team1.name = team1Name;
     g.team2.name = team2Name;
     g.ver = 1;
@@ -311,7 +335,13 @@ export default function App() {
     await patch({ team1: { ...g.team1, players: t1 }, team2: { ...g.team2, players: t2 } });
   };
 
-  const confirmTeams = () => patch({ phase: "words" });
+  const confirmTeams = () => {
+    const g = gRef.current;
+    const t1p = g.team1.players || [];
+    const t2p = g.team2.players || [];
+    if (t1p.length === 0 || t2p.length === 0) return alert("Both teams need players!");
+    return patch({ phase: "words", turnOrder: buildTurnOrder(t1p, t2p), currentTurnIdx: 0 });
+  };
 
   const submitWords = async () => {
     if (myWords.some(w => !w.trim())) return alert("Enter all 3 words!");
@@ -322,7 +352,7 @@ export default function App() {
 
   const buildTurnOrder = (t1p, t2p) => {
     const order = [];
-    const count = Math.max(t1p.length, t2p.length) * 6; // enough for all 4 rounds
+    const count = Math.max(t1p.length, t2p.length) * ((gRef.current.settings?.numRounds || DEFAULT_NUM_ROUNDS) + 2); // enough for all configured rounds
     let i1 = 0, i2 = 0;
     for (let i = 0; i < count; i++) {
       order.push({ team: 1, playerName: t1p[i1 % t1p.length] }); i1++;
@@ -341,7 +371,7 @@ export default function App() {
     await patch({
       phase: "playing", currentRound: 0,
       roundWords: shuffle(w),
-      turnOrder: buildTurnOrder(t1p, t2p),
+      turnOrder: (g.turnOrder && g.turnOrder.length) ? g.turnOrder : buildTurnOrder(t1p, t2p),
       currentTurnIdx: 0,
       turnActive: false, turnStartedAt: 0, skipsUsed: 0,
       wordLog: [],
@@ -377,7 +407,7 @@ export default function App() {
     const rw = [...(g.roundWords || [])];
     rw.shift(); // remove first element (the current word)
     const roundDone = rw.length === 0;
-    const gameDone = roundDone && (g.currentRound || 0) >= NUM_ROUNDS - 1;
+    const gameDone = roundDone && (g.currentRound || 0) >= (g.settings?.numRounds || DEFAULT_NUM_ROUNDS) - 1;
     const phaseUpdate = gameDone ? "gameOver" : roundDone ? "roundEnd" : g.phase;
     return { rw, phaseUpdate, roundDone };
   };
@@ -506,6 +536,14 @@ export default function App() {
                 ))}
               </div>
             </div>
+            <div style={{marginBottom:18}}>
+              <label style={{fontSize:12,color:C.muted,display:"block",marginBottom:6}}>Number of rounds</label>
+              <div style={{display:"flex",gap:6}}>
+                {[1,2,3,4,5,6].map(r=>(
+                  <button key={r} onClick={()=>setRoundOption(r)} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",background:roundOption===r?C.accent2:C.surface,color:roundOption===r?"#fff":C.muted,fontFamily:F.mono,fontSize:13,cursor:"pointer",fontWeight:roundOption===r?700:400,transition:"all .2s"}}>{r}</button>
+                ))}
+              </div>
+            </div>
             <div style={{display:"flex",gap:10}}>
               <Btn onClick={handleCreate} color={C.accent} style={{flex:1}}>Create Game</Btn>
               <Btn onClick={handleJoin} color={C.accent2} style={{flex:1}}>Join Game</Btn>
@@ -517,7 +555,7 @@ export default function App() {
         {joined && game.phase==="lobby" && (
           <Card style={{animation:"fadeIn .4s ease"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings?.timePerTurn || 30}s turns</h3>
+              <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings?.timePerTurn || 30}s turns · {totalRounds} rounds</h3>
               <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} players joined</span>
             </div>
             <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:18}}>
@@ -560,6 +598,7 @@ export default function App() {
               </div>
               {isAdmin && <Btn onClick={confirmTeams} style={{width:"100%",marginTop:14}}>Confirm Teams → Submit Words</Btn>}
             </Card>
+            {isAdmin && <TurnOrderPreview order={buildTurnOrder(game.team1.players || [], game.team2.players || [])} team1={game.team1} team2={game.team2} />}
           </div>
         )}
 
@@ -593,12 +632,15 @@ export default function App() {
             )}
           </Card>
         )}
+        {joined && game.phase==="words" && isAdmin && (
+          <TurnOrderPreview order={game.turnOrder || []} team1={game.team1} team2={game.team2} />
+        )}
 
         {/* ═══ PLAYING ═══ */}
         {joined && game.phase==="playing" && (
           <div style={{animation:"fadeIn .4s ease"}}>
             <div style={{textAlign:"center",marginBottom:10}}>
-              <RoundBadge round={game.currentRound || 0} />
+              <RoundBadge round={game.currentRound || 0} totalRounds={totalRounds} />
               <p style={{color:C.muted,fontSize:13,marginTop:5}}>Get through all the cards to finish the round!</p>
             </div>
             <Scoreboard team1={game.team1} team2={game.team2} />
@@ -661,10 +703,10 @@ export default function App() {
           <Card glow style={{animation:"fadeIn .4s ease",textAlign:"center"}}>
             <div style={{fontSize:44,marginBottom:6}}>🎉</div>
             <h2 style={{fontFamily:F.display,color:C.gold,margin:"0 0 6px"}}>Round {(game.currentRound||0)+1} Complete!</h2>
-            <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(NUM_ROUNDS-1)-(game.currentRound||0)} round{(NUM_ROUNDS-1)-(game.currentRound||0)!==1?"s":""} left.</p>
+            <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(totalRounds-1)-(game.currentRound||0)} round{(totalRounds-1)-(game.currentRound||0)!==1?"s":""} left.</p>
             <Scoreboard team1={game.team1} team2={game.team2} />
             <RoundWordAudit logs={game.wordLog || []} round={game.currentRound || 0} />
-            {isAdmin && (game.currentRound||0)<(NUM_ROUNDS-1) && (
+            {isAdmin && (game.currentRound||0)<(totalRounds-1) && (
               <Btn onClick={nextRound} style={{marginTop:18}}>Start Round {(game.currentRound||0)+2}</Btn>
             )}
           </Card>
@@ -691,7 +733,7 @@ export default function App() {
                   <div style={{fontFamily:F.display,fontSize:14,color:C.danger,marginTop:10,opacity:0.8}}>{loser} — Rohan is disappointed in you.</div>
                 </div>
               )}
-              <FullGameAudit logs={game.wordLog || []} />
+              <FullGameAudit logs={game.wordLog || []} totalRounds={totalRounds} />
               {isAdmin && <Btn onClick={resetGame} color={C.muted} style={{marginTop:18}}>Reset Game</Btn>}
             </Card>
           );
