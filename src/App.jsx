@@ -1,30 +1,40 @@
-import { useState, useEffect, useCallback, useRef, useReducer } from "react";
+import { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { saveGame, onGameUpdate } from "./firebase.js";
 
+// ─── Constants ───
 const NUM_ROUNDS = 4;
-const FISH_EMOJI = "🐟";
-const TROPHY_EMOJI = "🏆";
+const FISH = "🐟";
+const TROPHY = "🏆";
 
 function freshGame() {
   return {
-    phase: "lobby",
+    phase: "lobby",            // lobby | teams | words | playing | roundEnd | gameOver
     settings: { timePerTurn: 30 },
     team1: { name: "Team Shark 🦈", players: [], score: 0 },
     team2: { name: "Team Whale 🐋", players: [], score: 0 },
     allPlayers: [],
-    words: [],
-    roundWords: [],
-    currentWordIdx: 0,
+    words: [],                 // master list (never mutated during play)
+    roundWords: [],            // current round's remaining words — always show [0]
     currentRound: 0,
     turnOrder: [],
     currentTurnIdx: 0,
     turnActive: false,
-    timeLeft: 30,
+    turnStartedAt: 0,          // timestamp when turn started (clients compute countdown)
     skipsUsed: 0,
     wordsSubmitted: {},
     adminName: null,
     ver: 0,
   };
+}
+
+// ─── Shuffle helper ───
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 // ─── Styles ───
@@ -42,7 +52,7 @@ const F = {
 };
 const FONT_LINK = "https://fonts.googleapis.com/css2?family=Righteous&family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
 
-// ─── Components ───
+// ─── UI Components ───
 function Btn({ children, onClick, color = C.accent, disabled, style }) {
   return (
     <button onClick={onClick} disabled={disabled} style={{
@@ -82,12 +92,12 @@ function Scoreboard({ team1, team2 }) {
             textAlign: "center", minWidth: 150, transition: "all .3s",
           }}>
             <div style={{ fontFamily: F.display, fontSize: 15, color: C.text, marginBottom: 2 }}>
-              {t.name} {win ? TROPHY_EMOJI : ""}
+              {t.name} {win ? TROPHY : ""}
             </div>
             <div style={{ fontFamily: F.mono, fontSize: 34, fontWeight: 700, color: win ? C.gold : C.text }}>
               {t.score}
             </div>
-            <div style={{ fontSize: 11, color: C.muted }}>{t.players.length} players</div>
+            <div style={{ fontSize: 11, color: C.muted }}>{(t.players || []).length} players</div>
           </div>
         );
       })}
@@ -101,30 +111,20 @@ function RoundBadge({ round }) {
       display: "inline-flex", alignItems: "center", gap: 8,
       background: `linear-gradient(90deg, ${C.accent}, ${C.accent2})`,
       borderRadius: 20, padding: "6px 18px", fontFamily: F.display, fontSize: 14, color: "#fff",
-    }}>
-      Round {round + 1} of {NUM_ROUNDS}
-    </div>
+    }}>Round {round + 1} of {NUM_ROUNDS}</div>
   );
 }
 
-// ─── Main App ───
+// ═══════════════════════════════════════════
+// ─── MAIN APP ───
+// ═══════════════════════════════════════════
 export default function App() {
-  const gameRef = useRef(freshGame());
-  const [, forceRender] = useReducer(x => x + 1, 0);
-  const game = gameRef.current;
+  // ── Game state (synced with Firebase) ──
+  const gRef = useRef(freshGame());
+  const [, render] = useReducer(x => x + 1, 0);
+  const game = gRef.current;
 
-  const setGame = useCallback((g) => {
-    gameRef.current = g;
-    forceRender();
-  }, []);
-
-  const patch = useCallback(async (updates) => {
-    const ng = { ...gameRef.current, ...updates, ver: gameRef.current.ver + 1 };
-    gameRef.current = ng;
-    forceRender();
-    await saveGame(ng);
-  }, []);
-
+  // ── Local-only state (never touches Firebase) ──
   const [myName, setMyName] = useState("");
   const [joined, setJoined] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -133,119 +133,147 @@ export default function App() {
   const [team1Name, setTeam1Name] = useState("Team Shark 🦈");
   const [team2Name, setTeam2Name] = useState("Team Whale 🐋");
   const [timeOption, setTimeOption] = useState(30);
+  const [localTime, setLocalTime] = useState(30);  // LOCAL timer display
+  const [busy, setBusy] = useState(false);          // prevent double-clicks
   const myNameRef = useRef("");
 
   useEffect(() => { myNameRef.current = myName; }, [myName]);
 
-  // ── Firebase real-time listener (replaces polling!) ──
+  // ── Write to Firebase (only called on user actions) ──
+  const patch = useCallback(async (updates) => {
+    if (busy) return;
+    setBusy(true);
+    const ng = { ...gRef.current, ...updates, ver: (gRef.current.ver || 0) + 1 };
+    gRef.current = ng;
+    render();
+    await saveGame(ng);
+    setBusy(false);
+  }, [busy]);
+
+  // ── Firebase listener — receive remote changes ──
   useEffect(() => {
-    const unsubscribe = onGameUpdate((remote) => {
-      if (remote && remote.ver > gameRef.current.ver) {
-        gameRef.current = remote;
-        forceRender();
+    const unsub = onGameUpdate((remote) => {
+      if (!remote) return;
+      if ((remote.ver || 0) > (gRef.current.ver || 0)) {
+        gRef.current = remote;
+        render();
+        // Sync local timer from remote turnStartedAt
+        if (remote.turnActive && remote.turnStartedAt) {
+          const elapsed = Math.floor((Date.now() - remote.turnStartedAt) / 1000);
+          const remaining = Math.max(0, (remote.settings?.timePerTurn || 30) - elapsed);
+          setLocalTime(remaining);
+        } else if (!remote.turnActive) {
+          setLocalTime(remote.settings?.timePerTurn || 30);
+        }
       }
     });
-    return () => unsubscribe();
+    return () => unsub();
   }, []);
 
-  // ── Timer (admin only) ──
+  // ── Local timer — ticks every second, NO Firebase writes ──
   useEffect(() => {
-    const id = setInterval(async () => {
-      const g = gameRef.current;
-      const amIAdmin = g.adminName && g.adminName === myNameRef.current;
-      if (!amIAdmin || !g.turnActive || g.timeLeft <= 0) return;
-      const newTime = g.timeLeft - 1;
-      if (newTime <= 0) {
+    const id = setInterval(() => {
+      const g = gRef.current;
+      if (!g.turnActive || !g.turnStartedAt) return;
+      const elapsed = Math.floor((Date.now() - g.turnStartedAt) / 1000);
+      const remaining = Math.max(0, (g.settings?.timePerTurn || 30) - elapsed);
+      setLocalTime(remaining);
+
+      // Admin auto-ends turn when time hits 0
+      if (remaining <= 0 && g.adminName === myNameRef.current) {
         const ng = {
-          ...g, timeLeft: g.settings.timePerTurn, turnActive: false,
-          currentTurnIdx: g.currentTurnIdx + 1, skipsUsed: 0, ver: g.ver + 1,
+          ...g,
+          turnActive: false,
+          turnStartedAt: 0,
+          currentTurnIdx: (g.currentTurnIdx || 0) + 1,
+          skipsUsed: 0,
+          ver: (g.ver || 0) + 1,
         };
-        gameRef.current = ng; forceRender(); await saveGame(ng);
-      } else {
-        const ng = { ...g, timeLeft: newTime, ver: g.ver + 1 };
-        gameRef.current = ng; forceRender(); await saveGame(ng);
+        gRef.current = ng;
+        render();
+        setLocalTime(g.settings?.timePerTurn || 30);
+        saveGame(ng);
       }
-    }, 1000);
+    }, 250); // tick 4x/sec for smooth display, but only admin writes on 0
     return () => clearInterval(id);
   }, []);
 
-  // ── Derived ──
-  const currentTurn = game.turnOrder ? game.turnOrder[game.currentTurnIdx] : null;
-  const currentWord = game.roundWords ? game.roundWords[game.currentWordIdx] : null;
+  // ── Derived values ──
+  const turnOrder = game.turnOrder || [];
+  const currentTurn = turnOrder[game.currentTurnIdx || 0] || null;
+  const roundWords = game.roundWords || [];
+  const currentWord = roundWords[0] || null;  // ALWAYS first element
   const isMyTurn = currentTurn && currentTurn.playerName === myName;
   const amAdmin = myName === game.adminName;
+  const players = game.allPlayers || [];
+  const submitted = game.wordsSubmitted || {};
+  const submittedCount = Object.keys(submitted).length;
 
-  // ── Handlers ──
+  // ══════════ HANDLERS (each writes to Firebase exactly once) ══════════
+
   const handleCreate = async () => {
     if (!inputName.trim()) return;
     const g = freshGame();
     g.adminName = inputName.trim();
     g.allPlayers = [inputName.trim()];
     g.settings.timePerTurn = timeOption;
-    g.timeLeft = timeOption;
     g.team1.name = team1Name;
     g.team2.name = team2Name;
     g.ver = 1;
-    setMyName(inputName.trim());
-    setIsAdmin(true);
-    setJoined(true);
-    setGame(g);
+    setMyName(inputName.trim()); setIsAdmin(true); setJoined(true);
+    setLocalTime(timeOption);
+    gRef.current = g; render();
     await saveGame(g);
   };
 
   const handleJoin = async () => {
     if (!inputName.trim()) return;
-    const g = gameRef.current;
-    if (!g || !g.adminName) return alert("No game found! Ask the admin to create one first.");
-    if ((g.allPlayers || []).includes(inputName.trim())) {
-      setMyName(inputName.trim());
-      setJoined(true);
-      if (g.adminName === inputName.trim()) setIsAdmin(true);
+    const g = gRef.current;
+    if (!g.adminName) return alert("No game found! Ask the admin to create one first.");
+    const name = inputName.trim();
+    if ((g.allPlayers || []).includes(name)) {
+      setMyName(name); setJoined(true);
+      if (g.adminName === name) setIsAdmin(true);
       return;
     }
-    const players = [...(g.allPlayers || []), inputName.trim()];
-    setMyName(inputName.trim());
-    setJoined(true);
-    await patch({ allPlayers: players });
+    setMyName(name); setJoined(true);
+    await patch({ allPlayers: [...(g.allPlayers || []), name] });
   };
 
   const handleRandomize = async () => {
-    const g = gameRef.current;
-    const shuffled = [...(g.allPlayers || [])].sort(() => Math.random() - 0.5);
+    const g = gRef.current;
+    const shuffled = shuffle(g.allPlayers || []);
     const mid = Math.ceil(shuffled.length / 2);
     let t1 = shuffled.slice(0, mid);
     let t2 = shuffled.slice(mid);
     if (t2.length === 0 && t1.length > 0) t2 = [t1[0]];
     await patch({
-      team1: { ...g.team1, name: team1Name, players: t1, score: 0 },
-      team2: { ...g.team2, name: team2Name, players: t2, score: 0 },
+      team1: { name: team1Name, players: t1, score: 0 },
+      team2: { name: team2Name, players: t2, score: 0 },
       phase: "teams",
     });
   };
 
   const movePlayer = async (player, toTeam) => {
-    const g = gameRef.current;
+    const g = gRef.current;
     const t1 = (g.team1.players || []).filter(p => p !== player);
     const t2 = (g.team2.players || []).filter(p => p !== player);
     if (toTeam === 1) t1.push(player); else t2.push(player);
-    await patch({
-      team1: { ...g.team1, players: t1 },
-      team2: { ...g.team2, players: t2 },
-    });
+    await patch({ team1: { ...g.team1, players: t1 }, team2: { ...g.team2, players: t2 } });
   };
 
   const confirmTeams = () => patch({ phase: "words" });
 
   const submitWords = async () => {
     if (myWords.some(w => !w.trim())) return alert("Enter all 3 words!");
-    const g = gameRef.current;
+    const g = gRef.current;
     const ws = { ...(g.wordsSubmitted || {}), [myName]: myWords.map(w => w.trim()) };
     await patch({ wordsSubmitted: ws, words: Object.values(ws).flat() });
   };
 
   const buildTurnOrder = (t1p, t2p) => {
     const order = [];
-    const count = Math.max(t1p.length, t2p.length) * 5;
+    const count = Math.max(t1p.length, t2p.length) * 6; // enough for all 4 rounds
     let i1 = 0, i2 = 0;
     for (let i = 0; i < count; i++) {
       order.push({ team: 1, playerName: t1p[i1 % t1p.length] }); i1++;
@@ -255,82 +283,104 @@ export default function App() {
   };
 
   const startGame = async () => {
-    const g = gameRef.current;
-    if ((g.words || []).length === 0) return alert("No words submitted!");
-    if ((g.team1.players || []).length === 0 || (g.team2.players || []).length === 0)
-      return alert("Both teams need players!");
-    const shuffled = [...g.words].sort(() => Math.random() - 0.5);
-    const order = buildTurnOrder(g.team1.players, g.team2.players);
+    const g = gRef.current;
+    const w = g.words || [];
+    if (w.length === 0) return alert("No words submitted!");
+    const t1p = g.team1.players || [];
+    const t2p = g.team2.players || [];
+    if (t1p.length === 0 || t2p.length === 0) return alert("Both teams need players!");
     await patch({
-      phase: "playing", currentRound: 0, roundWords: shuffled,
-      currentWordIdx: 0, turnOrder: order, currentTurnIdx: 0,
-      turnActive: false, timeLeft: g.settings.timePerTurn, skipsUsed: 0,
+      phase: "playing", currentRound: 0,
+      roundWords: shuffle(w),
+      turnOrder: buildTurnOrder(t1p, t2p),
+      currentTurnIdx: 0,
+      turnActive: false, turnStartedAt: 0, skipsUsed: 0,
+    });
+    setLocalTime(g.settings.timePerTurn);
+  };
+
+  const startTurn = async () => {
+    const g = gRef.current;
+    setLocalTime(g.settings.timePerTurn);
+    await patch({
+      turnActive: true,
+      turnStartedAt: Date.now(),
+      skipsUsed: 0,
     });
   };
 
-  const startTurn = () => patch({
-    turnActive: true, timeLeft: gameRef.current.settings.timePerTurn, skipsUsed: 0,
-  });
-
-  const checkRoundEnd = (rw, round) => {
-    if (rw.length === 0) {
-      return { phase: round >= (NUM_ROUNDS - 1) ? "gameOver" : "roundEnd", turnActive: false };
-    }
-    return {};
+  // Remove word from front of roundWords, check if round ends
+  const removeCurrentWord = (g) => {
+    const rw = [...(g.roundWords || [])];
+    rw.shift(); // remove first element (the current word)
+    const roundDone = rw.length === 0;
+    const gameDone = roundDone && (g.currentRound || 0) >= NUM_ROUNDS - 1;
+    const phaseUpdate = gameDone ? "gameOver" : roundDone ? "roundEnd" : g.phase;
+    return { rw, phaseUpdate, roundDone };
   };
 
   const handleCorrect = async () => {
-    const g = gameRef.current;
-    const ct = (g.turnOrder || [])[g.currentTurnIdx]; if (!ct) return;
-    const tk = ct.team === 1 ? "team1" : "team2";
-    const rw = [...(g.roundWords || [])];
-    rw.splice(g.currentWordIdx, 1);
-    const newIdx = g.currentWordIdx >= rw.length ? 0 : g.currentWordIdx;
+    const g = gRef.current;
+    if (!currentTurn || !currentWord) return;
+    const tk = currentTurn.team === 1 ? "team1" : "team2";
+    const { rw, phaseUpdate, roundDone } = removeCurrentWord(g);
     await patch({
-      [tk]: { ...g[tk], score: g[tk].score + 2 },
-      roundWords: rw, currentWordIdx: newIdx, ...checkRoundEnd(rw, g.currentRound),
+      [tk]: { ...g[tk], score: (g[tk].score || 0) + 2 },
+      roundWords: rw,
+      phase: phaseUpdate,
+      turnActive: roundDone ? false : g.turnActive,
+      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
     });
   };
 
   const handleSkip = async () => {
-    const g = gameRef.current;
-    const ct = (g.turnOrder || [])[g.currentTurnIdx]; if (!ct) return;
-    const tk = ct.team === 1 ? "team1" : "team2";
-    const rw = [...(g.roundWords || [])];
-    rw.splice(g.currentWordIdx, 1);
-    const newIdx = g.currentWordIdx >= rw.length ? 0 : g.currentWordIdx;
-    const end = checkRoundEnd(rw, g.currentRound);
-    if (g.skipsUsed < 2) {
-      await patch({ roundWords: rw, currentWordIdx: newIdx, skipsUsed: g.skipsUsed + 1, ...end });
-    } else {
-      await patch({
-        [tk]: { ...g[tk], score: g[tk].score - 1 },
-        roundWords: rw, currentWordIdx: newIdx, skipsUsed: g.skipsUsed + 1, ...end,
-      });
-    }
+    const g = gRef.current;
+    if (!currentTurn || !currentWord) return;
+    const tk = currentTurn.team === 1 ? "team1" : "team2";
+    const skips = g.skipsUsed || 0;
+    const { rw, phaseUpdate, roundDone } = removeCurrentWord(g);
+    const scoreDelta = skips < 2 ? 0 : -1;
+    await patch({
+      [tk]: { ...g[tk], score: (g[tk].score || 0) + scoreDelta },
+      roundWords: rw,
+      skipsUsed: skips + 1,
+      phase: phaseUpdate,
+      turnActive: roundDone ? false : g.turnActive,
+      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+    });
   };
 
   const handleIncorrect = async () => {
-    const g = gameRef.current;
-    const rw = [...(g.roundWords || [])];
-    rw.splice(g.currentWordIdx, 1);
-    const newIdx = g.currentWordIdx >= rw.length ? 0 : g.currentWordIdx;
-    await patch({ roundWords: rw, currentWordIdx: newIdx, ...checkRoundEnd(rw, g.currentRound) });
+    const g = gRef.current;
+    if (!currentWord) return;
+    const { rw, phaseUpdate, roundDone } = removeCurrentWord(g);
+    await patch({
+      roundWords: rw,
+      phase: phaseUpdate,
+      turnActive: roundDone ? false : g.turnActive,
+      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+    });
   };
 
   const nextRound = async () => {
-    const g = gameRef.current;
-    const shuffled = [...(g.words || [])].sort(() => Math.random() - 0.5);
+    const g = gRef.current;
+    setLocalTime(g.settings.timePerTurn);
     await patch({
-      phase: "playing", currentRound: g.currentRound + 1,
-      roundWords: shuffled, currentWordIdx: 0,
-      turnActive: false, timeLeft: g.settings.timePerTurn, skipsUsed: 0,
+      phase: "playing",
+      currentRound: (g.currentRound || 0) + 1,
+      roundWords: shuffle(g.words || []),
+      turnActive: false,
+      turnStartedAt: 0,
+      skipsUsed: 0,
+      // currentTurnIdx carries over!
     });
   };
 
   const resetGame = async () => {
-    setGame(freshGame()); setJoined(false); setIsAdmin(false); setMyName(""); setMyWords(["","",""]);
-    await saveGame(freshGame());
+    const g = freshGame();
+    gRef.current = g; render();
+    setJoined(false); setIsAdmin(false); setMyName(""); setMyWords(["", "", ""]);
+    await saveGame(g);
   };
 
   // ═══════════ RENDER ═══════════
@@ -339,9 +389,6 @@ export default function App() {
     background: C.surface, border: `1px solid ${C.border}`,
     color: C.text, fontSize: 15, outline: "none", fontFamily: F.body,
   };
-
-  const submittedCount = game.wordsSubmitted ? Object.keys(game.wordsSubmitted).length : 0;
-  const playerCount = (game.allPlayers || []).length;
 
   return (
     <div style={{
@@ -360,19 +407,20 @@ export default function App() {
 
       <div style={{position:"fixed",inset:0,overflow:"hidden",pointerEvents:"none",zIndex:0}}>
         {[...Array(10)].map((_,i)=>(
-          <div key={i} style={{position:"absolute",fontSize:14+(i%5)*4,left:`${10+(i*9)%80}%`,top:`${5+(i*13)%85}%`,opacity:0.05,animation:`fishDrift ${10+i*2}s ease-in-out infinite`,animationDelay:`${i*0.7}s`}}>{FISH_EMOJI}</div>
+          <div key={i} style={{position:"absolute",fontSize:14+(i%5)*4,left:`${10+(i*9)%80}%`,top:`${5+(i*13)%85}%`,opacity:0.05,animation:`fishDrift ${10+i*2}s ease-in-out infinite`,animationDelay:`${i*0.7}s`}}>{FISH}</div>
         ))}
       </div>
 
       <div style={{maxWidth:580,margin:"0 auto",position:"relative",zIndex:1}}>
+        {/* Header */}
         <div style={{textAlign:"center",marginBottom:24}}>
           <h1 style={{fontFamily:F.display,fontSize:30,margin:0,letterSpacing:1,background:`linear-gradient(90deg,${C.accent},${C.accent3})`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
-            {FISH_EMOJI} Rohan's Fishbowl {FISH_EMOJI}
+            {FISH} Rohan's Fishbowl {FISH}
           </h1>
           <div style={{color:C.muted,fontSize:12,marginTop:3}}>Happy 30th Birthday, Rohan! Let the games begin.</div>
         </div>
 
-        {/* JOIN / CREATE */}
+        {/* ═══ JOIN / CREATE ═══ */}
         {!joined && (
           <Card glow style={{animation:"fadeIn .5s ease"}}>
             <div style={{textAlign:"center",marginBottom:18}}>
@@ -396,32 +444,30 @@ export default function App() {
           </Card>
         )}
 
-        {/* LOBBY */}
+        {/* ═══ LOBBY ═══ */}
         {joined && game.phase==="lobby" && (
           <Card style={{animation:"fadeIn .4s ease"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings.timePerTurn}s turns</h3>
-              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{playerCount} joined</span>
+              <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings?.timePerTurn || 30}s turns</h3>
+              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} joined</span>
             </div>
             <div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:18}}>
-              {(game.allPlayers||[]).map(p=>(
+              {players.map(p=>(
                 <span key={p} style={{background:p===game.adminName?C.accent+"33":C.surface,border:`1px solid ${p===game.adminName?C.accent:C.border}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:p===myName?C.accent3:C.text,fontWeight:p===myName?700:400}}>{p}{p===game.adminName?" 👑":""}{p===myName?" (you)":""}</span>
               ))}
             </div>
-            {isAdmin && (
-              <>
-                <div style={{display:"flex",gap:8,marginBottom:12}}>
-                  <input value={team1Name} onChange={e=>setTeam1Name(e.target.value)} placeholder="Team 1 name" style={{...S,flex:1}} />
-                  <input value={team2Name} onChange={e=>setTeam2Name(e.target.value)} placeholder="Team 2 name" style={{...S,flex:1}} />
-                </div>
-                <Btn onClick={handleRandomize} color={C.accent2} style={{width:"100%"}}>Randomize Teams & Continue</Btn>
-              </>
-            )}
+            {isAdmin && (<>
+              <div style={{display:"flex",gap:8,marginBottom:12}}>
+                <input value={team1Name} onChange={e=>setTeam1Name(e.target.value)} placeholder="Team 1" style={{...S,flex:1}} />
+                <input value={team2Name} onChange={e=>setTeam2Name(e.target.value)} placeholder="Team 2" style={{...S,flex:1}} />
+              </div>
+              <Btn onClick={handleRandomize} color={C.accent2} style={{width:"100%"}}>Randomize Teams & Continue</Btn>
+            </>)}
             {!isAdmin && <p style={{textAlign:"center",color:C.muted,fontSize:13}}>Waiting for {game.adminName} to set up teams...</p>}
           </Card>
         )}
 
-        {/* TEAMS */}
+        {/* ═══ TEAMS ═══ */}
         {joined && game.phase==="teams" && (
           <div style={{animation:"fadeIn .4s ease"}}>
             <Scoreboard team1={game.team1} team2={game.team2} />
@@ -445,25 +491,23 @@ export default function App() {
           </div>
         )}
 
-        {/* WORDS */}
+        {/* ═══ WORDS ═══ */}
         {joined && game.phase==="words" && (
           <Card style={{animation:"fadeIn .4s ease"}}>
             <h3 style={{fontFamily:F.display,textAlign:"center",color:C.accent3,margin:"0 0 2px"}}>🎉 Words for Rohan</h3>
             <p style={{textAlign:"center",color:C.muted,fontSize:13,marginBottom:18}}>Enter 3 words or phrases about the birthday boy!</p>
-            {game.wordsSubmitted && game.wordsSubmitted[myName] ? (
+            {submitted[myName] ? (
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:38,marginBottom:6}}>✅</div>
                 <p style={{color:C.success,fontWeight:600,margin:"0 0 4px"}}>Words submitted!</p>
-                <p style={{color:C.muted,fontSize:13}}>{submittedCount} / {playerCount} players done</p>
+                <p style={{color:C.muted,fontSize:13}}>{submittedCount} / {players.length} players done</p>
               </div>
-            ) : (
-              <>
-                {myWords.map((w,i)=>(
-                  <input key={i} value={w} onChange={e=>{const nw=[...myWords];nw[i]=e.target.value;setMyWords(nw)}} placeholder={`Word ${i+1}...`} style={{...S,marginBottom:9}} />
-                ))}
-                <Btn onClick={submitWords} style={{width:"100%"}}>Submit Words</Btn>
-              </>
-            )}
+            ) : (<>
+              {myWords.map((w,i)=>(
+                <input key={i} value={w} onChange={e=>{const nw=[...myWords];nw[i]=e.target.value;setMyWords(nw)}} placeholder={`Word ${i+1}...`} style={{...S,marginBottom:9}} />
+              ))}
+              <Btn onClick={submitWords} style={{width:"100%"}}>Submit Words</Btn>
+            </>)}
             {isAdmin && submittedCount>=1 && (
               <Btn onClick={startGame} color={C.success} style={{width:"100%",marginTop:12}}>
                 Start Game! ({(game.words||[]).length} words from {submittedCount} players)
@@ -472,11 +516,11 @@ export default function App() {
           </Card>
         )}
 
-        {/* PLAYING */}
+        {/* ═══ PLAYING ═══ */}
         {joined && game.phase==="playing" && (
           <div style={{animation:"fadeIn .4s ease"}}>
             <div style={{textAlign:"center",marginBottom:10}}>
-              <RoundBadge round={game.currentRound} />
+              <RoundBadge round={game.currentRound || 0} />
               <p style={{color:C.muted,fontSize:13,marginTop:5}}>Get through all the cards to finish the round!</p>
             </div>
             <Scoreboard team1={game.team1} team2={game.team2} />
@@ -488,51 +532,66 @@ export default function App() {
                   <div style={{fontSize:12,color:C.muted}}>{currentTurn.team===1?game.team1.name:game.team2.name}</div>
                 </div>
               )}
-              <div style={{fontFamily:F.mono,fontSize:52,fontWeight:700,color:game.timeLeft<=5?C.danger:game.timeLeft<=10?C.warn:C.accent3,animation:game.turnActive&&game.timeLeft<=5?"pulse .5s infinite":"none",marginBottom:10,transition:"color .3s"}}>{game.timeLeft}s</div>
+
+              {/* Timer — purely local, no Firebase writes */}
+              <div style={{
+                fontFamily:F.mono,fontSize:52,fontWeight:700,
+                color:localTime<=5?C.danger:localTime<=10?C.warn:C.accent3,
+                animation:game.turnActive&&localTime<=5?"pulse .5s infinite":"none",
+                marginBottom:10,transition:"color .3s",
+              }}>{localTime}s</div>
+
               <div style={{fontSize:12,color:C.muted,marginBottom:14}}>
-                {(game.roundWords||[]).length} card{(game.roundWords||[]).length!==1?"s":""} left · Skips used: {game.skipsUsed} (2 free)
+                {roundWords.length} card{roundWords.length!==1?"s":""} left · Skips used: {game.skipsUsed||0} (2 free)
               </div>
 
+              {/* Word card — always roundWords[0] */}
               {game.turnActive && (isMyTurn||amAdmin) && currentWord && (
                 <div style={{background:`linear-gradient(135deg,${C.accent}22,${C.accent2}22)`,borderRadius:14,padding:"24px 18px",marginBottom:14,border:`2px solid ${C.accent}55`,animation:"fadeIn .3s ease"}}>
                   <div style={{fontSize:11,color:C.muted,marginBottom:5}}>THE WORD IS</div>
                   <div style={{fontFamily:F.display,fontSize:28,color:C.gold,textShadow:`0 0 18px ${C.gold}44`}}>{currentWord}</div>
                 </div>
               )}
+
+              {/* Waiting for other player */}
               {game.turnActive && !isMyTurn && !amAdmin && (
                 <div style={{background:C.surface,borderRadius:14,padding:"24px 18px",marginBottom:14}}>
                   <div style={{fontSize:36,marginBottom:6}}>👀</div>
                   <div style={{color:C.muted}}>{currentTurn?.playerName} is playing...</div>
                 </div>
               )}
+
+              {/* Start turn button */}
               {!game.turnActive && (isMyTurn||amAdmin) && (
                 <Btn onClick={startTurn}>{isMyTurn?"Start My Turn!":`Start ${currentTurn?.playerName}'s Turn`}</Btn>
               )}
+
+              {/* Action buttons */}
               {game.turnActive && (isMyTurn||amAdmin) && (
                 <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
-                  <Btn onClick={handleCorrect} color={C.success}>✓ Rohan Approves (+2)</Btn>
-                  <Btn onClick={handleSkip} color={C.warn}>⏭ Skip {game.skipsUsed>=2?"(-1)":`(${2-game.skipsUsed} free)`}</Btn>
-                  <Btn onClick={handleIncorrect} color={C.danger}>✗ Rohan Disapproves</Btn>
+                  <Btn onClick={handleCorrect} color={C.success} disabled={busy}>✓ Rohan Approves (+2)</Btn>
+                  <Btn onClick={handleSkip} color={C.warn} disabled={busy}>⏭ Skip {(game.skipsUsed||0)>=2?"(-1)":`(${2-(game.skipsUsed||0)} free)`}</Btn>
+                  <Btn onClick={handleIncorrect} color={C.danger} disabled={busy}>✗ Rohan Disapproves</Btn>
                 </div>
               )}
             </Card>
           </div>
         )}
 
-        {/* ROUND END */}
+        {/* ═══ ROUND END ═══ */}
         {joined && game.phase==="roundEnd" && (
           <Card glow style={{animation:"fadeIn .4s ease",textAlign:"center"}}>
             <div style={{fontSize:44,marginBottom:6}}>🎉</div>
-            <h2 style={{fontFamily:F.display,color:C.gold,margin:"0 0 6px"}}>Round {game.currentRound+1} Complete!</h2>
-            <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(NUM_ROUNDS-1)-game.currentRound} round{(NUM_ROUNDS-1)-game.currentRound!==1?"s":""} left.</p>
+            <h2 style={{fontFamily:F.display,color:C.gold,margin:"0 0 6px"}}>Round {(game.currentRound||0)+1} Complete!</h2>
+            <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(NUM_ROUNDS-1)-(game.currentRound||0)} round{(NUM_ROUNDS-1)-(game.currentRound||0)!==1?"s":""} left.</p>
             <Scoreboard team1={game.team1} team2={game.team2} />
-            {isAdmin && game.currentRound<(NUM_ROUNDS-1) && (
-              <Btn onClick={nextRound} style={{marginTop:18}}>Start Round {game.currentRound+2}</Btn>
+            {isAdmin && (game.currentRound||0)<(NUM_ROUNDS-1) && (
+              <Btn onClick={nextRound} style={{marginTop:18}}>Start Round {(game.currentRound||0)+2}</Btn>
             )}
           </Card>
         )}
 
-        {/* GAME OVER */}
+        {/* ═══ GAME OVER ═══ */}
         {joined && game.phase==="gameOver" && (()=>{
           const tied=game.team1.score===game.team2.score;
           const t1W=game.team1.score>game.team2.score;
@@ -558,7 +617,7 @@ export default function App() {
           );
         })()}
 
-        <div style={{textAlign:"center",marginTop:28,color:C.muted,fontSize:10}}>Made with {FISH_EMOJI} for Rohan's 30th</div>
+        <div style={{textAlign:"center",marginTop:28,color:C.muted,fontSize:10}}>Made with {FISH} for Rohan's 30th</div>
       </div>
     </div>
   );
