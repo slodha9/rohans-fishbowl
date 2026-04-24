@@ -179,10 +179,14 @@ export default function App() {
       const remaining = Math.max(0, (g.settings?.timePerTurn || 30) - elapsed);
       setLocalTime(remaining);
 
-      // Admin auto-ends turn when time hits 0
-      if (remaining <= 0 && g.adminName === myNameRef.current) {
+      // Current player auto-ends their own turn when time hits 0.
+      // Any word still showing with no button pressed remains in roundWords,
+      // then the remaining words are reshuffled before the next turn.
+      const activeTurn = (g.turnOrder || [])[g.currentTurnIdx || 0];
+      if (remaining <= 0 && activeTurn?.playerName === myNameRef.current) {
         const ng = {
           ...g,
+          roundWords: shuffle(g.roundWords || []),
           turnActive: false,
           turnStartedAt: 0,
           currentTurnIdx: (g.currentTurnIdx || 0) + 1,
@@ -204,7 +208,6 @@ export default function App() {
   const roundWords = game.roundWords || [];
   const currentWord = roundWords[0] || null;  // ALWAYS first element
   const isMyTurn = currentTurn && currentTurn.playerName === myName;
-  const amAdmin = myName === game.adminName;
   const players = game.allPlayers || [];
   const submitted = game.wordsSubmitted || {};
   const submittedCount = Object.keys(submitted).length;
@@ -303,6 +306,9 @@ export default function App() {
     const g = gRef.current;
     setLocalTime(g.settings.timePerTurn);
     await patch({
+      // Safety reshuffle before every turn starts, so nobody inherits
+      // the exact last visible word from the previous turn.
+      roundWords: shuffle(g.roundWords || []),
       turnActive: true,
       turnStartedAt: Date.now(),
       skipsUsed: 0,
@@ -546,7 +552,7 @@ export default function App() {
               </div>
 
               {/* Word card — always roundWords[0] */}
-              {game.turnActive && (isMyTurn||amAdmin) && currentWord && (
+              {game.turnActive && isMyTurn && currentWord && (
                 <div style={{background:`linear-gradient(135deg,${C.accent}22,${C.accent2}22)`,borderRadius:14,padding:"24px 18px",marginBottom:14,border:`2px solid ${C.accent}55`,animation:"fadeIn .3s ease"}}>
                   <div style={{fontSize:11,color:C.muted,marginBottom:5}}>THE WORD IS</div>
                   <div style={{fontFamily:F.display,fontSize:28,color:C.gold,textShadow:`0 0 18px ${C.gold}44`}}>{currentWord}</div>
@@ -554,7 +560,7 @@ export default function App() {
               )}
 
               {/* Waiting for other player */}
-              {game.turnActive && !isMyTurn && !amAdmin && (
+              {game.turnActive && !isMyTurn && (
                 <div style={{background:C.surface,borderRadius:14,padding:"24px 18px",marginBottom:14}}>
                   <div style={{fontSize:36,marginBottom:6}}>👀</div>
                   <div style={{color:C.muted}}>{currentTurn?.playerName} is playing...</div>
@@ -562,12 +568,12 @@ export default function App() {
               )}
 
               {/* Start turn button */}
-              {!game.turnActive && (isMyTurn||amAdmin) && (
-                <Btn onClick={startTurn}>{isMyTurn?"Start My Turn!":`Start ${currentTurn?.playerName}'s Turn`}</Btn>
+              {!game.turnActive && isMyTurn && (
+                <Btn onClick={startTurn}>Start My Turn!</Btn>
               )}
 
               {/* Action buttons */}
-              {game.turnActive && (isMyTurn||amAdmin) && (
+              {game.turnActive && isMyTurn && (
                 <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
                   <Btn onClick={handleCorrect} color={C.success} disabled={busy}>✓ Rohan Approves (+2)</Btn>
                   <Btn onClick={handleSkip} color={C.warn} disabled={busy}>⏭ Skip {(game.skipsUsed||0)>=2?"(-1)":`(${2-(game.skipsUsed||0)} free)`}</Btn>
