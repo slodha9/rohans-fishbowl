@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useReducer, useCallback } from "react";
-import { saveGame, onGameUpdate } from "./firebase.js";
+import { saveGame, updateGameSafely, onGameUpdate } from "./firebase.js";
 
 /*
  * BUG FIXES APPLIED:
@@ -27,6 +27,11 @@ import { saveGame, onGameUpdate } from "./firebase.js";
  * #23 TurnOrderPreview uses ensureArray
  * #24 All mutating buttons disabled during save
  * #25 auditEntry captures word before removal
+ * #26 Multiplayer mutations use Firebase transactions
+ * #27 Only admin/monitor can control turns
+ * #28 Admin can mark one joined player as Rohan / Any-team player
+ * #29 Current player can skip; simultaneous button presses are guarded
+ * #30 Rohan submits words too and appears last in each repeating turn cycle
  */
 
 const DEFAULT_NUM_ROUNDS = 4;
@@ -52,6 +57,8 @@ function freshGame() {
     wordLog: [],
     adminName: null,
     adminSessionId: null,
+    rohanName: null,
+    rohanSessionId: null,
     ver: 0,
   };
 }
@@ -147,10 +154,12 @@ function RoundBadge({ round, totalRounds }) {
   );
 }
 
-function RoundWordAudit({ logs, round, title }) {
+function RoundWordAudit({ logs, round, title, team1Name = "Team 1", team2Name = "Team 2" }) {
   const roundLogs = ensureArray(logs).filter(l => l.round === round);
   const groups = [
     { key: "approved", label: "Rohan Approved", color: C.success },
+    { key: "team1_awarded", label: `${team1Name} Scored`, color: C.success },
+    { key: "team2_awarded", label: `${team2Name} Scored`, color: C.success },
     { key: "skipped", label: "Skipped", color: C.warn },
     { key: "disapproved", label: "Rohan Disapproved", color: C.danger },
   ];
@@ -177,21 +186,21 @@ function RoundWordAudit({ logs, round, title }) {
   );
 }
 
-function FullGameAudit({ logs, totalRounds }) {
+function FullGameAudit({ logs, totalRounds, team1Name = "Team 1", team2Name = "Team 2" }) {
   return (
     <div style={{ marginTop: 14 }}>
       {[...Array(totalRounds)].map((_, r) => {
         const has = ensureArray(logs).some(l => l.round === r);
-        return has ? <RoundWordAudit key={r} logs={logs} round={r} title={`Round ${r + 1} Word Log`} /> : null;
+        return has ? <RoundWordAudit key={r} logs={logs} round={r} title={`Round ${r + 1} Word Log`} team1Name={team1Name} team2Name={team2Name} /> : null;
       })}
     </div>
   );
 }
 
-function TurnOrderPreview({ order, team1, team2 }) {
+function TurnOrderPreview({ order, team1, team2, rohanName }) {
   const safeOrder = ensureArray(order);
   if (safeOrder.length === 0) return null;
-  const cycle = Math.max(1, ensureArray(team1.players).length + ensureArray(team2.players).length);
+  const cycle = Math.max(1, ensureArray(team1.players).length + ensureArray(team2.players).length + (rohanName ? 1 : 0));
   const preview = safeOrder.slice(0, Math.min(safeOrder.length, cycle * 2));
   return (
     <Card style={{ marginTop: 14 }}>
@@ -202,7 +211,7 @@ function TurnOrderPreview({ order, team1, team2 }) {
           <div key={`${turn.playerName}-${idx}`} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: C.surface, borderRadius: 9, padding: "8px 10px", fontSize: 13 }}>
             <span style={{ fontFamily: F.mono, color: C.muted }}>#{idx + 1}</span>
             <span style={{ flex: 1, color: C.text, fontWeight: 700 }}>{turn.playerName}</span>
-            <span style={{ color: turn.team === 1 ? C.accent : C.accent2 }}>{turn.team === 1 ? team1.name : team2.name}</span>
+            <span style={{ color: turn.team === 1 ? C.accent : turn.team === 2 ? C.accent2 : C.gold }}>{turn.team === 1 ? team1.name : turn.team === 2 ? team2.name : "Any Team"}</span>
           </div>
         ))}
       </div>
@@ -243,10 +252,17 @@ export default function App() {
     savingRef.current = true;
     setSaving(true);
     try {
-      const ng = { ...gRef.current, ...updates, ver: (gRef.current.ver || 0) + 1 };
-      gRef.current = ng;
-      render();
-      await saveGame(ng);
+      const result = await updateGameSafely((current) => {
+        const base = current || gRef.current || freshGame();
+        const nextUpdates = typeof updates === "function" ? updates(base) : updates;
+        if (nextUpdates === null) return base;
+        return { ...base, ...nextUpdates, ver: (base.ver || 0) + 1 };
+      });
+      const saved = result?.snapshot?.val?.();
+      if (saved) {
+        gRef.current = saved;
+        render();
+      }
     } catch (e) {
       console.error("Patch failed:", e);
     } finally {
@@ -260,21 +276,24 @@ export default function App() {
     const unsub = onGameUpdate((remote) => {
       if (!remote) return;
       setFirebaseReady(true);
-      if ((remote.ver || 0) > (gRef.current.ver || 0)) {
-        gRef.current = remote;
-        render();
-        if (remote.turnActive && remote.turnStartedAt) {
-          const elapsed = Math.floor((Date.now() - remote.turnStartedAt) / 1000);
-          setLocalTime(Math.max(0, (remote.settings?.timePerTurn || 30) - elapsed));
-        } else if (!remote.turnActive) {
-          setLocalTime(remote.settings?.timePerTurn || 30);
-        }
+
+      // Accept every server snapshot, not just higher ver numbers.
+      // Reset writes a fresh game with ver: 0, so a strict "remote.ver > local.ver"
+      // check can make other devices ignore reset.
+      gRef.current = remote;
+      render();
+      if (remote.turnActive && remote.turnStartedAt) {
+        const elapsed = Math.floor((Date.now() - remote.turnStartedAt) / 1000);
+        setLocalTime(Math.max(0, (remote.settings?.timePerTurn || 30) - elapsed));
+      } else if (!remote.turnActive) {
+        setLocalTime(remote.settings?.timePerTurn || 30);
       }
     });
     return () => { if (typeof unsub === "function") unsub(); };
   }, []);
 
-  // Fix #1/#14/#17: Local timer — only active admin session auto-ends turns
+  // Fix #1/#14/#17: Local timer — only counts down locally.
+  // At 0s, the turn stays open so admin can make a buzzer judgement.
   useEffect(() => {
     const id = setInterval(() => {
       const g = gRef.current;
@@ -282,25 +301,6 @@ export default function App() {
       const elapsed = Math.floor((Date.now() - g.turnStartedAt) / 1000);
       const remaining = Math.max(0, (g.settings?.timePerTurn || 30) - elapsed);
       setLocalTime(remaining);
-
-      const isActiveAdmin = g.adminName === myNameRef.current && g.adminSessionId === SESSION_ID;
-      if (remaining <= 0 && isActiveAdmin && !savingRef.current) {
-        savingRef.current = true;
-        setSaving(true);
-        const ng = {
-          ...g,
-          turnActive: false,
-          turnStartedAt: 0,
-          roundWords: ensureArray(g.roundWords), // no reshuffle (#3)
-          currentTurnIdx: (g.currentTurnIdx || 0) + 1,
-          skipsUsed: 0,
-          ver: (g.ver || 0) + 1,
-        };
-        gRef.current = ng;
-        render();
-        setLocalTime(g.settings?.timePerTurn || 30);
-        saveGame(ng).finally(() => { savingRef.current = false; setSaving(false); });
-      }
     }, 250);
     return () => clearInterval(id);
   }, []);
@@ -313,9 +313,14 @@ export default function App() {
   const currentWord = roundWords[0] || null;
   const isMyTurn = currentTurn && currentTurn.playerName === myName;
   const amAdmin = myName === game.adminName;
+  const amRohan = myName && myName === game.rohanName;
+  const activeAdmin = amAdmin && game.adminSessionId === SESSION_ID;
+  const isAnyTurn = currentTurn?.team === "any";
+  const canCurrentPlayerSkip = game.turnActive && isMyTurn && !activeAdmin;
   const players = ensureArray(game.allPlayers);
   const submitted = game.wordsSubmitted || {};
   const submittedCount = Object.keys(submitted).length;
+  const expectedSubmitters = players.length + (game.rohanName ? 1 : 0);
   const totalRounds = game.settings?.numRounds || DEFAULT_NUM_ROUNDS;
 
   // ══════════ HANDLERS ══════════
@@ -342,59 +347,152 @@ export default function App() {
     if (!firebaseReady) await new Promise(r => setTimeout(r, 1500));
     const g = gRef.current;
     if (!g.adminName) return alert("No game found! Ask the admin to create one first.");
+    if (g.rohanName === name) {
+      setMyName(name); setIsAdmin(false); setJoined(true);
+      await patch({ rohanSessionId: SESSION_ID });
+      return;
+    }
     if (g.adminName === name) {
       setMyName(name); setIsAdmin(true); setJoined(true);
       await patch({ adminSessionId: SESSION_ID });
       return;
     }
-    if (players.includes(name)) {
+    const latestPlayers = ensureArray(gRef.current.allPlayers);
+    if (latestPlayers.includes(name)) {
       setMyName(name); setJoined(true);
       return;
     }
     setMyName(name); setJoined(true);
-    await patch({ allPlayers: [...players, name] });
+    await patch((current) => {
+      const currentPlayers = ensureArray(current.allPlayers);
+      if (current.rohanName === name) return { rohanSessionId: SESSION_ID };
+      if (currentPlayers.includes(name)) return {};
+      return { allPlayers: [...currentPlayers, name] };
+    });
   };
 
   const handleRandomize = async () => {
-    if (players.length === 0) return alert("No players have joined yet!");
-    const shuffled = shuffle(players);
-    const mid = Math.ceil(shuffled.length / 2);
-    const t1 = shuffled.slice(0, mid);
-    const t2 = shuffled.slice(mid);
-    if (t2.length === 0) t2.push(t1[0]);
-    await patch({
-      team1: { name: team1Name, players: t1, score: 0 },
-      team2: { name: team2Name, players: t2, score: 0 },
-      phase: "teams",
+    if (!activeAdmin) return;
+    if (players.length < 2) return alert("At least 2 players need to join before randomizing teams!");
+    await patch((current) => {
+      const currentPlayers = ensureArray(current.allPlayers).filter(p => p !== current.rohanName);
+      if (currentPlayers.length < 2) return null;
+      const shuffled = shuffle(currentPlayers);
+      const mid = Math.ceil(shuffled.length / 2);
+      const t1 = shuffled.slice(0, mid);
+      const t2 = shuffled.slice(mid);
+      return {
+        allPlayers: currentPlayers,
+        team1: { name: team1Name, players: t1, score: 0 },
+        team2: { name: team2Name, players: t2, score: 0 },
+        phase: "teams",
+      };
     });
   };
 
   const movePlayer = async (player, toTeam) => {
+    if (!activeAdmin) return;
     const g = gRef.current;
-    const t1 = ensureArray(g.team1.players).filter(p => p !== player);
-    const t2 = ensureArray(g.team2.players).filter(p => p !== player);
-    if (toTeam === 1) t1.push(player); else t2.push(player);
-    if (t1.length === 0 || t2.length === 0) return alert("Can't leave a team empty!");
-    await patch({ team1: { ...g.team1, players: t1 }, team2: { ...g.team2, players: t2 } });
+    const previewT1 = ensureArray(g.team1.players).filter(p => p !== player);
+    const previewT2 = ensureArray(g.team2.players).filter(p => p !== player);
+    if (toTeam === 1) previewT1.push(player); else previewT2.push(player);
+    if (previewT1.length === 0 || previewT2.length === 0) return alert("Can't leave a team empty!");
+
+    await patch((current) => {
+      const t1 = ensureArray(current.team1?.players).filter(p => p !== player);
+      const t2 = ensureArray(current.team2?.players).filter(p => p !== player);
+      if (toTeam === 1) t1.push(player); else t2.push(player);
+      if (t1.length === 0 || t2.length === 0) return null;
+      return { team1: { ...current.team1, players: t1 }, team2: { ...current.team2, players: t2 } };
+    });
   };
 
-  const buildTurnOrder = (t1p, t2p) => {
-    const order = [];
-    const count = Math.max(t1p.length, t2p.length) * (totalRounds + 4);
-    let i1 = 0, i2 = 0;
-    for (let i = 0; i < count; i++) {
-      order.push({ team: 1, playerName: t1p[i1 % t1p.length] }); i1++;
-      order.push({ team: 2, playerName: t2p[i2 % t2p.length] }); i2++;
+  const makeRohan = async (player) => {
+    if (!activeAdmin) return;
+    const g = gRef.current;
+    if (g.rohanName && g.rohanName !== player) {
+      return alert(`${g.rohanName} is already set as Rohan. Remove that first if needed.`);
     }
-    return order;
+    const previewT1 = ensureArray(g.team1.players).filter(p => p !== player);
+    const previewT2 = ensureArray(g.team2.players).filter(p => p !== player);
+    if (previewT1.length === 0 || previewT2.length === 0) return alert("Making this player Rohan would leave a team empty.");
+
+    await patch((current) => {
+      if (!["teams", "words"].includes(current.phase)) return null;
+      if (current.adminName === player) return null;
+      if (current.rohanName && current.rohanName !== player) return null;
+      const t1 = ensureArray(current.team1?.players).filter(p => p !== player);
+      const t2 = ensureArray(current.team2?.players).filter(p => p !== player);
+      if (t1.length === 0 || t2.length === 0) return null;
+      const teamPlayers = ensureArray(current.allPlayers).filter(p => p !== player);
+      const rounds = current.settings?.numRounds || DEFAULT_NUM_ROUNDS;
+      const updates = {
+        rohanName: player,
+        rohanSessionId: null,
+        allPlayers: teamPlayers,
+        team1: { ...current.team1, players: t1 },
+        team2: { ...current.team2, players: t2 },
+      };
+      if (current.phase === "words") {
+        updates.turnOrder = buildTurnOrder(t1, t2, rounds, player);
+      }
+      return updates;
+    });
+  };
+
+  const clearRohan = async () => {
+    if (!activeAdmin) return;
+    await patch((current) => {
+      if (!["teams", "words"].includes(current.phase) || !current.rohanName) return null;
+      const rohan = current.rohanName;
+      const restoredPlayers = ensureArray(current.allPlayers).includes(rohan)
+        ? ensureArray(current.allPlayers)
+        : [...ensureArray(current.allPlayers), rohan];
+      const t1 = ensureArray(current.team1?.players);
+      const t2 = ensureArray(current.team2?.players);
+      const addToTeam1 = t1.length <= t2.length;
+      const nextT1 = addToTeam1 && !t1.includes(rohan) ? [...t1, rohan] : t1;
+      const nextT2 = !addToTeam1 && !t2.includes(rohan) ? [...t2, rohan] : t2;
+      return {
+        rohanName: null,
+        rohanSessionId: null,
+        allPlayers: restoredPlayers,
+        team1: { ...current.team1, players: nextT1 },
+        team2: { ...current.team2, players: nextT2 },
+        turnOrder: [],
+      };
+    });
+  };
+
+  const buildTurnOrder = (t1p, t2p, rounds = totalRounds, rohanName = gRef.current.rohanName) => {
+    const team1Players = ensureArray(t1p);
+    const team2Players = ensureArray(t2p);
+    const oneCycle = [];
+    const maxLen = Math.max(team1Players.length, team2Players.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (team1Players[i]) oneCycle.push({ team: 1, playerName: team1Players[i] });
+      if (team2Players[i]) oneCycle.push({ team: 2, playerName: team2Players[i] });
+    }
+    if (rohanName) oneCycle.push({ team: "any", playerName: rohanName });
+    if (oneCycle.length === 0) return [];
+
+    const cyclesToBuild = Math.max(20, (rounds || DEFAULT_NUM_ROUNDS) * 10);
+    return Array.from({ length: cyclesToBuild }).flatMap(() => oneCycle);
   };
 
   const confirmTeams = () => {
+    if (!activeAdmin) return;
     const g = gRef.current;
     const t1p = ensureArray(g.team1.players);
     const t2p = ensureArray(g.team2.players);
     if (t1p.length === 0 || t2p.length === 0) return alert("Both teams need players!");
-    return patch({ phase: "words", turnOrder: buildTurnOrder(t1p, t2p), currentTurnIdx: 0 });
+    return patch((current) => {
+      const ct1p = ensureArray(current.team1?.players);
+      const ct2p = ensureArray(current.team2?.players);
+      if (ct1p.length === 0 || ct2p.length === 0) return null;
+      const rounds = current.settings?.numRounds || DEFAULT_NUM_ROUNDS;
+      return { phase: "words", turnOrder: buildTurnOrder(ct1p, ct2p, rounds, current.rohanName), currentTurnIdx: 0 };
+    });
   };
 
   const submitWords = async () => {
@@ -404,33 +502,49 @@ export default function App() {
     const existing = ensureArray(g.words);
     const dupes = trimmed.filter(w => existing.map(e => e.toLowerCase()).includes(w.toLowerCase()));
     if (dupes.length > 0 && !confirm(`"${dupes.join('", "')}" already submitted by someone. Submit anyway?`)) return;
-    const ws = { ...(g.wordsSubmitted || {}), [myName]: trimmed };
-    await patch({ wordsSubmitted: ws, words: Object.values(ws).flat() });
+    await patch((current) => {
+      const ws = { ...(current.wordsSubmitted || {}), [myName]: trimmed };
+      return { wordsSubmitted: ws, words: Object.values(ws).flat() };
+    });
   };
 
   const startGame = async () => {
+    if (!activeAdmin) return;
     const g = gRef.current;
     const w = ensureArray(g.words);
     if (w.length === 0) return alert("No words submitted!");
     const t1p = ensureArray(g.team1.players);
     const t2p = ensureArray(g.team2.players);
     if (t1p.length === 0 || t2p.length === 0) return alert("Both teams need players!");
-    if (submittedCount < players.length && !confirm(`Only ${submittedCount}/${players.length} players submitted. Start anyway?`)) return;
-    const stored = ensureArray(g.turnOrder);
-    await patch({
-      phase: "playing", currentRound: 0,
-      roundWords: shuffle(w),
-      turnOrder: stored.length > 0 ? stored : buildTurnOrder(t1p, t2p),
-      currentTurnIdx: 0,
-      turnActive: false, turnStartedAt: 0, skipsUsed: 0, wordLog: [],
+    if (submittedCount < expectedSubmitters && !confirm(`Only ${submittedCount}/${expectedSubmitters} people submitted. Start anyway?`)) return;
+    await patch((current) => {
+      const currentWords = ensureArray(current.words);
+      const ct1p = ensureArray(current.team1?.players);
+      const ct2p = ensureArray(current.team2?.players);
+      if (currentWords.length === 0 || ct1p.length === 0 || ct2p.length === 0) return null;
+      const rounds = current.settings?.numRounds || DEFAULT_NUM_ROUNDS;
+      return {
+        phase: "playing", currentRound: 0,
+        roundWords: shuffle(currentWords),
+        turnOrder: buildTurnOrder(ct1p, ct2p, rounds, current.rohanName),
+        currentTurnIdx: 0,
+        turnActive: false, turnStartedAt: 0, skipsUsed: 0, wordLog: [],
+      };
     });
     setLocalTime(g.settings.timePerTurn);
   };
 
   // Fix #3: no reshuffle on turn start
   const startTurn = async () => {
+    if (!activeAdmin) return;
+    if (!currentWord) return alert("No words left in this round.");
     setLocalTime(gRef.current.settings.timePerTurn);
-    await patch({ turnActive: true, turnStartedAt: Date.now(), skipsUsed: 0 });
+    await patch((current) => {
+      const stillActiveAdmin = current.adminName === myNameRef.current && current.adminSessionId === SESSION_ID;
+      const hasWord = ensureArray(current.roundWords)[0];
+      if (!stillActiveAdmin || current.phase !== "playing" || current.turnActive || !hasWord) return null;
+      return { turnActive: true, turnStartedAt: Date.now(), skipsUsed: 0 };
+    });
   };
 
   // Fix #25: capture word before removal
@@ -444,7 +558,7 @@ export default function App() {
       result,
       playerName: turn.playerName || "Unknown",
       team: turn.team || null,
-      teamName: turn.team === 1 ? (g.team1?.name || "Team 1") : (g.team2?.name || "Team 2"),
+      teamName: turn.team === 1 ? (g.team1?.name || "Team 1") : turn.team === 2 ? (g.team2?.name || "Team 2") : "Any Team",
     };
   };
 
@@ -457,62 +571,179 @@ export default function App() {
     return { rw, phase: gameDone ? "gameOver" : roundDone ? "roundEnd" : g.phase, roundDone };
   };
 
+  const isTimerExpired = (g) => {
+    if (!g.turnActive || !g.turnStartedAt) return false;
+    const elapsed = Math.floor((Date.now() - g.turnStartedAt) / 1000);
+    return elapsed >= (g.settings?.timePerTurn || 30);
+  };
+
+  const expiredTurnEndUpdates = (g, roundDone) => {
+    if (roundDone) return { turnActive: false, turnStartedAt: 0 };
+    if (!isTimerExpired(g)) return { turnActive: g.turnActive, turnStartedAt: g.turnStartedAt };
+    return {
+      turnActive: false,
+      turnStartedAt: 0,
+      currentTurnIdx: (g.currentTurnIdx || 0) + 1,
+      skipsUsed: 0,
+    };
+  };
+
+  const startNextTurnAfterExpired = async () => {
+    if (!activeAdmin) return;
+    const expected = actionContext();
+    await patch((g) => {
+      const stillActiveAdmin = g.adminName === myNameRef.current && g.adminSessionId === SESSION_ID;
+      if (!stillActiveAdmin || g.phase !== "playing" || !g.turnActive || !isTimerExpired(g) || !sameActionTarget(g, expected)) return null;
+      const words = ensureArray(g.roundWords);
+      if (words.length === 0) return null;
+      return {
+        roundWords: shuffle(words),
+        currentTurnIdx: (g.currentTurnIdx || 0) + 1,
+        turnActive: true,
+        turnStartedAt: Date.now(),
+        skipsUsed: 0,
+      };
+    });
+    setLocalTime(gRef.current.settings?.timePerTurn || 30);
+  };
+
+  const actionContext = () => {
+    const words = ensureArray(gRef.current.roundWords);
+    return {
+      word: words[0] || null,
+      wordCount: words.length,
+      turnIdx: gRef.current.currentTurnIdx || 0,
+      round: gRef.current.currentRound || 0,
+    };
+  };
+
+  const sameActionTarget = (g, expected) => {
+    if (!expected) return false;
+    const words = ensureArray(g.roundWords);
+    const word = words[0] || null;
+    return word === expected.word
+      && words.length === expected.wordCount
+      && (g.currentTurnIdx || 0) === expected.turnIdx
+      && (g.currentRound || 0) === expected.round;
+  };
+
+  const canMutateCurrentAction = (g, expected, allowCurrentPlayerSkip = false) => {
+    const stillActiveAdmin = g.adminName === myNameRef.current && g.adminSessionId === SESSION_ID;
+    const order = ensureArray(g.turnOrder);
+    const idx = order.length > 0 ? (g.currentTurnIdx || 0) % order.length : 0;
+    const turn = order[idx] || null;
+    const isTurnPlayer = allowCurrentPlayerSkip && turn?.playerName === myNameRef.current && !isTimerExpired(g);
+    return (stillActiveAdmin || isTurnPlayer) && g.phase === "playing" && g.turnActive && sameActionTarget(g, expected);
+  };
+
   // Fix #4: round-end does NOT increment currentTurnIdx
   const handleCorrect = async () => {
-    const g = gRef.current;
-    if (!currentTurn || !currentWord) return;
-    const tk = currentTurn.team === 1 ? "team1" : "team2";
-    const entry = auditEntry(g, "approved");
-    const { rw, phase, roundDone } = removeCurrentWord(g);
-    await patch({
-      [tk]: { ...g[tk], score: (g[tk].score || 0) + 2 },
-      wordLog: [...ensureArray(g.wordLog), entry],
-      roundWords: rw, phase,
-      turnActive: roundDone ? false : g.turnActive,
-      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+    if (!activeAdmin) return;
+    const expected = actionContext();
+    await patch((g) => {
+      if (!canMutateCurrentAction(g, expected)) return null;
+      const order = ensureArray(g.turnOrder);
+      const idx = order.length > 0 ? (g.currentTurnIdx || 0) % order.length : 0;
+      const turn = order[idx] || null;
+      const word = ensureArray(g.roundWords)[0] || null;
+      if (!turn || !word || turn.team === "any") return {};
+      const tk = turn.team === 1 ? "team1" : "team2";
+      const entry = auditEntry(g, "approved");
+      const { rw, phase, roundDone } = removeCurrentWord(g);
+      return {
+        [tk]: { ...g[tk], score: (g[tk].score || 0) + 2 },
+        wordLog: [...ensureArray(g.wordLog), entry],
+        roundWords: rw, phase,
+        ...expiredTurnEndUpdates(g, roundDone),
+      };
     });
   };
 
   const handleSkip = async () => {
-    const g = gRef.current;
-    if (!currentTurn || !currentWord) return;
-    const tk = currentTurn.team === 1 ? "team1" : "team2";
-    const skips = g.skipsUsed || 0;
-    const entry = auditEntry(g, "skipped");
-    const { rw, phase, roundDone } = removeCurrentWord(g);
-    await patch({
-      [tk]: { ...g[tk], score: (g[tk].score || 0) + (skips < 2 ? 0 : -1) },
-      wordLog: [...ensureArray(g.wordLog), entry],
-      roundWords: rw, skipsUsed: skips + 1, phase,
-      turnActive: roundDone ? false : g.turnActive,
-      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+    if (!(activeAdmin || canCurrentPlayerSkip)) return;
+    const expected = actionContext();
+    await patch((g) => {
+      if (!canMutateCurrentAction(g, expected, true)) return null;
+      const order = ensureArray(g.turnOrder);
+      const idx = order.length > 0 ? (g.currentTurnIdx || 0) % order.length : 0;
+      const turn = order[idx] || null;
+      const word = ensureArray(g.roundWords)[0] || null;
+      if (!turn || !word) return {};
+      const skips = g.skipsUsed || 0;
+      const entry = auditEntry(g, "skipped");
+      const { rw, phase, roundDone } = removeCurrentWord(g);
+      const updates = {
+        wordLog: [...ensureArray(g.wordLog), entry],
+        roundWords: rw, skipsUsed: skips + 1, phase,
+        ...expiredTurnEndUpdates(g, roundDone),
+      };
+      if (turn.team === 1 || turn.team === 2) {
+        const tk = turn.team === 1 ? "team1" : "team2";
+        updates[tk] = { ...g[tk], score: (g[tk].score || 0) + (skips < 2 ? 0 : -1) };
+      }
+      return updates;
     });
   };
 
   // Fix #9: guards currentTurn
   const handleIncorrect = async () => {
-    const g = gRef.current;
-    if (!currentTurn || !currentWord) return;
-    const entry = auditEntry(g, "disapproved");
-    const { rw, phase, roundDone } = removeCurrentWord(g);
-    await patch({
-      wordLog: [...ensureArray(g.wordLog), entry],
-      roundWords: rw, phase,
-      turnActive: roundDone ? false : g.turnActive,
-      turnStartedAt: roundDone ? 0 : g.turnStartedAt,
+    if (!activeAdmin) return;
+    const expected = actionContext();
+    await patch((g) => {
+      if (!canMutateCurrentAction(g, expected)) return null;
+      const order = ensureArray(g.turnOrder);
+      const idx = order.length > 0 ? (g.currentTurnIdx || 0) % order.length : 0;
+      const turn = order[idx] || null;
+      const word = ensureArray(g.roundWords)[0] || null;
+      if (!turn || !word) return {};
+      const entry = auditEntry(g, "disapproved");
+      const { rw, phase, roundDone } = removeCurrentWord(g);
+      return {
+        wordLog: [...ensureArray(g.wordLog), entry],
+        roundWords: rw, phase,
+        ...expiredTurnEndUpdates(g, roundDone),
+      };
+    });
+  };
+
+  const handleAnyTeamAward = async (teamNumber) => {
+    if (!activeAdmin) return;
+    const expected = actionContext();
+    await patch((g) => {
+      if (!canMutateCurrentAction(g, expected)) return null;
+      const order = ensureArray(g.turnOrder);
+      const idx = order.length > 0 ? (g.currentTurnIdx || 0) % order.length : 0;
+      const turn = order[idx] || null;
+      const word = ensureArray(g.roundWords)[0] || null;
+      if (!turn || !word || turn.team !== "any") return {};
+      const tk = teamNumber === 1 ? "team1" : "team2";
+      const entry = { ...auditEntry(g, teamNumber === 1 ? "team1_awarded" : "team2_awarded"), team: teamNumber, teamName: g[tk]?.name || `Team ${teamNumber}` };
+      const { rw, phase, roundDone } = removeCurrentWord(g);
+      return {
+        [tk]: { ...g[tk], score: (g[tk].score || 0) + 2 },
+        wordLog: [...ensureArray(g.wordLog), entry],
+        roundWords: rw, phase,
+        ...expiredTurnEndUpdates(g, roundDone),
+      };
     });
   };
 
   // Fix #4: nextRound increments currentTurnIdx by 1 (advance past player who ended round)
   const nextRound = async () => {
+    if (!activeAdmin) return;
     const g = gRef.current;
     setLocalTime(g.settings.timePerTurn);
-    await patch({
-      phase: "playing",
-      currentRound: (g.currentRound || 0) + 1,
-      roundWords: shuffle(ensureArray(g.words)),
-      currentTurnIdx: (g.currentTurnIdx || 0) + 1,
-      turnActive: false, turnStartedAt: 0, skipsUsed: 0,
+    await patch((current) => {
+      const stillActiveAdmin = current.adminName === myNameRef.current && current.adminSessionId === SESSION_ID;
+      const total = current.settings?.numRounds || DEFAULT_NUM_ROUNDS;
+      if (!stillActiveAdmin || current.phase !== "roundEnd" || (current.currentRound || 0) >= total - 1) return null;
+      return {
+        phase: "playing",
+        currentRound: (current.currentRound || 0) + 1,
+        roundWords: shuffle(ensureArray(current.words)),
+        currentTurnIdx: (current.currentTurnIdx || 0) + 1,
+        turnActive: false, turnStartedAt: 0, skipsUsed: 0,
+      };
     });
   };
 
@@ -585,9 +816,9 @@ export default function App() {
                 ))}
               </div>
             </div>
-            <div style={{display:"flex",gap:10}}>
-              <Btn onClick={handleCreate} color={C.accent} style={{flex:1}} disabled={saving}>Create Game</Btn>
-              <Btn onClick={handleJoin} color={C.accent2} style={{flex:1}} disabled={saving}>Join Game</Btn>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              <Btn onClick={handleCreate} color={C.accent} style={{flex:"1 1 140px"}} disabled={saving}>Create Game</Btn>
+              <Btn onClick={handleJoin} color={C.accent2} style={{flex:"1 1 140px"}} disabled={saving}>Join Game</Btn>
             </div>
           </Card>
         )}
@@ -597,7 +828,7 @@ export default function App() {
           <Card style={{animation:"fadeIn .4s ease"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
               <h3 style={{fontFamily:F.display,margin:0,color:C.accent3}}>Lobby — {game.settings?.timePerTurn||30}s · {totalRounds} rnd{totalRounds!==1?"s":""}</h3>
-              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} joined</span>
+              <span style={{fontFamily:F.mono,fontSize:12,color:C.muted}}>{players.length} team player{players.length!==1?"s":""}{game.rohanName?" + Rohan":""}</span>
             </div>
             {players.length===0?(
               <div style={{textAlign:"center",color:C.muted,fontSize:13,padding:"16px 0",background:C.surface,borderRadius:10,marginBottom:18}}>Waiting for players to join...</div>
@@ -606,6 +837,9 @@ export default function App() {
                 {players.map(p=>(
                   <span key={p} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:p===myName?C.accent3:C.text,fontWeight:p===myName?700:400}}>{p}{p===myName?" (you)":""}</span>
                 ))}
+                {game.rohanName && (
+                  <span style={{background:C.gold+"22",border:`1px solid ${C.gold}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:C.gold,fontWeight:700}}>⭐ {game.rohanName} / Any Player{game.rohanName===myName?" (you)":""}</span>
+                )}
               </div>
             )}
             {amAdmin && (
@@ -613,14 +847,14 @@ export default function App() {
                 <span style={{background:C.accent+"33",border:`1px solid ${C.accent}`,borderRadius:18,padding:"5px 14px",fontSize:13,color:C.accent}}>👑 {myName} (admin)</span>
               </div>
             )}
-            {isAdmin && (<>
+            {activeAdmin && (<>
               <div style={{display:"flex",gap:8,marginBottom:12}}>
                 <input value={team1Name} onChange={e=>setTeam1Name(e.target.value)} placeholder="Team 1" style={{...S,flex:1}} />
                 <input value={team2Name} onChange={e=>setTeam2Name(e.target.value)} placeholder="Team 2" style={{...S,flex:1}} />
               </div>
-              <Btn onClick={handleRandomize} color={C.accent2} style={{width:"100%"}} disabled={saving||players.length===0}>Randomize Teams & Continue</Btn>
+              <Btn onClick={handleRandomize} color={C.accent2} style={{width:"100%"}} disabled={saving||players.length<2}>Randomize Teams & Continue</Btn>
             </>)}
-            {!isAdmin && <p style={{textAlign:"center",color:C.muted,fontSize:13}}>Waiting for {game.adminName} to set up teams...</p>}
+            {!activeAdmin && <p style={{textAlign:"center",color:C.muted,fontSize:13}}>Waiting for {game.adminName} to set up teams...</p>}
           </Card>
         )}
 
@@ -637,15 +871,26 @@ export default function App() {
                     {ensureArray(team.players).map(p=>(
                       <div key={p} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 10px",borderRadius:7,background:C.surface,marginBottom:3,fontSize:13}}>
                         <span style={{color:p===myName?C.accent3:C.text}}>{p}{p===myName?" ★":""}</span>
-                        {isAdmin && <button onClick={()=>movePlayer(p,ti===0?2:1)} disabled={saving} style={{background:"none",border:"none",color:saving?C.border:C.muted,cursor:saving?"not-allowed":"pointer",fontSize:11}}>move →</button>}
+                        {activeAdmin && (
+                          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                            <button onClick={()=>movePlayer(p,ti===0?2:1)} disabled={saving} style={{background:"none",border:"none",color:saving?C.border:C.muted,cursor:saving?"not-allowed":"pointer",fontSize:11}}>move →</button>
+                            <button onClick={()=>makeRohan(p)} disabled={saving || game.rohanName===p} style={{background:"none",border:"none",color:game.rohanName===p?C.gold:(saving?C.border:C.muted),cursor:saving?"not-allowed":"pointer",fontSize:11}}>make Rohan</button>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
                 ))}
               </div>
-              {isAdmin && <Btn onClick={confirmTeams} style={{width:"100%",marginTop:14}} disabled={saving}>Confirm Teams → Submit Words</Btn>}
+              {game.rohanName && (
+                <div style={{marginTop:12,background:C.gold+"22",border:`1px solid ${C.gold}`,borderRadius:10,padding:"9px 10px",fontSize:13,color:C.gold,textAlign:"center",fontWeight:700}}>
+                  ⭐ Rohan / Any Player: {game.rohanName}
+                  {activeAdmin && <button onClick={clearRohan} disabled={saving} style={{marginLeft:8,background:"none",border:"none",color:saving?C.border:C.gold,cursor:saving?"not-allowed":"pointer",fontSize:11}}>remove</button>}
+                </div>
+              )}
+              {activeAdmin && <Btn onClick={confirmTeams} style={{width:"100%",marginTop:14}} disabled={saving}>Confirm Teams → Submit Words</Btn>}
             </Card>
-            {isAdmin && <TurnOrderPreview order={buildTurnOrder(ensureArray(game.team1.players),ensureArray(game.team2.players))} team1={game.team1} team2={game.team2} />}
+            {activeAdmin && <TurnOrderPreview order={buildTurnOrder(ensureArray(game.team1.players),ensureArray(game.team2.players), totalRounds, game.rohanName)} team1={game.team1} team2={game.team2} rohanName={game.rohanName} />}
           </div>
         )}
 
@@ -658,13 +903,13 @@ export default function App() {
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:38,marginBottom:6}}>👑</div>
                 <p style={{color:C.accent3,fontWeight:600,margin:"0 0 4px"}}>Admin / Monitor</p>
-                <p style={{color:C.muted,fontSize:13}}>{players.length===0?"No players yet":`${submittedCount} / ${players.length} players done`}</p>
+                <p style={{color:C.muted,fontSize:13}}>{expectedSubmitters===0?"No players yet":`${submittedCount} / ${expectedSubmitters} people done`}</p>
               </div>
             ) : submitted[myName] ? (
               <div style={{textAlign:"center"}}>
                 <div style={{fontSize:38,marginBottom:6}}>✅</div>
                 <p style={{color:C.success,fontWeight:600,margin:"0 0 4px"}}>Words submitted!</p>
-                <p style={{color:C.muted,fontSize:13}}>{submittedCount} / {players.length} players done</p>
+                <p style={{color:C.muted,fontSize:13}}>{submittedCount} / {expectedSubmitters} people done</p>
               </div>
             ) : (<>
               {myWords.map((w,i)=>(
@@ -672,15 +917,15 @@ export default function App() {
               ))}
               <Btn onClick={submitWords} style={{width:"100%"}} disabled={saving}>Submit Words</Btn>
             </>)}
-            {isAdmin && submittedCount>=1 && (
+            {activeAdmin && submittedCount>=1 && (
               <Btn onClick={startGame} color={C.success} style={{width:"100%",marginTop:12}} disabled={saving}>
-                Start Game! ({ensureArray(game.words).length} words from {submittedCount}/{players.length} players)
+                Start Game! ({ensureArray(game.words).length} words from {submittedCount}/{expectedSubmitters} people)
               </Btn>
             )}
           </Card>
         )}
-        {joined && game.phase==="words" && isAdmin && (
-          <TurnOrderPreview order={ensureArray(game.turnOrder)} team1={game.team1} team2={game.team2} />
+        {joined && game.phase==="words" && activeAdmin && (
+          <TurnOrderPreview order={ensureArray(game.turnOrder)} team1={game.team1} team2={game.team2} rohanName={game.rohanName} />
         )}
 
         {/* PLAYING */}
@@ -695,8 +940,8 @@ export default function App() {
               {currentTurn && (
                 <div style={{marginBottom:14}}>
                   <div style={{fontSize:12,color:C.muted,marginBottom:3}}>Now playing</div>
-                  <div style={{fontFamily:F.display,fontSize:21,color:currentTurn.team===1?C.accent:C.accent2}}>{currentTurn.playerName}</div>
-                  <div style={{fontSize:12,color:C.muted}}>{currentTurn.team===1?game.team1.name:game.team2.name}</div>
+                  <div style={{fontFamily:F.display,fontSize:21,color:currentTurn.team===1?C.accent:currentTurn.team===2?C.accent2:C.gold}}>{currentTurn.playerName}</div>
+                  <div style={{fontSize:12,color:C.muted}}>{currentTurn.team===1?game.team1.name:currentTurn.team===2?game.team2.name:"Any Team"}</div>
                 </div>
               )}
               <div style={{fontFamily:F.mono,fontSize:52,fontWeight:700,color:localTime<=5?C.danger:localTime<=10?C.warn:C.accent3,animation:game.turnActive&&localTime<=5?"pulse .5s infinite":"none",marginBottom:10,transition:"color .3s"}}>{localTime}s</div>
@@ -713,18 +958,35 @@ export default function App() {
               {game.turnActive && !isMyTurn && !amAdmin && (
                 <div style={{background:C.surface,borderRadius:14,padding:"24px 18px",marginBottom:14}}>
                   <div style={{fontSize:36,marginBottom:6}}>👀</div>
-                  <div style={{color:C.muted}}>{currentTurn?.playerName} is playing...</div>
+                  <div style={{color:C.muted}}>{currentTurn?.playerName} is playing{currentTurn?.team === "any" ? " for anyone to answer" : ""}...</div>
                 </div>
               )}
-              {!game.turnActive && (isMyTurn||amAdmin) && (
-                <Btn onClick={startTurn} disabled={saving}>{isMyTurn?"Start My Turn!":`Start ${currentTurn?.playerName}'s Turn`}</Btn>
+              {!game.turnActive && activeAdmin && (
+                <Btn onClick={startTurn} disabled={saving}>{`Start ${currentTurn?.playerName}'s Turn`}</Btn>
               )}
-              {game.turnActive && (isMyTurn||amAdmin) && (
+              {game.turnActive && activeAdmin && !isAnyTurn && (
                 <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
                   <Btn onClick={handleCorrect} color={C.success} disabled={saving}>✓ Rohan Approves (+2)</Btn>
                   <Btn onClick={handleSkip} color={C.warn} disabled={saving}>⏭ Skip {(game.skipsUsed||0)>=2?"(-1)":`(${2-(game.skipsUsed||0)} free)`}</Btn>
                   <Btn onClick={handleIncorrect} color={C.danger} disabled={saving}>✗ Rohan Disapproves</Btn>
                 </div>
+              )}
+              {game.turnActive && activeAdmin && isAnyTurn && (
+                <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
+                  <Btn onClick={()=>handleAnyTeamAward(1)} color={C.accent} disabled={saving}>✓ {game.team1.name} Gets It (+2)</Btn>
+                  <Btn onClick={()=>handleAnyTeamAward(2)} color={C.accent2} disabled={saving}>✓ {game.team2.name} Gets It (+2)</Btn>
+                  <Btn onClick={handleSkip} color={C.warn} disabled={saving}>⏭ Skip</Btn>
+                </div>
+              )}
+              {game.turnActive && isMyTurn && !activeAdmin && currentWord && (
+                <div style={{display:"flex",justifyContent:"center",marginTop:10}}>
+                  <Btn onClick={handleSkip} color={C.warn} disabled={saving}>⏭ Skip</Btn>
+                </div>
+              )}
+              {game.turnActive && activeAdmin && localTime <= 0 && (
+                <Btn onClick={startNextTurnAfterExpired} color={C.accent2} disabled={saving} style={{marginTop:10}}>
+                  Start Next Player's Turn — Reshuffle Unresolved Word
+                </Btn>
               )}
             </Card>
           </div>
@@ -737,8 +999,8 @@ export default function App() {
             <h2 style={{fontFamily:F.display,color:C.gold,margin:"0 0 6px"}}>Round {(game.currentRound||0)+1} Complete!</h2>
             <p style={{color:C.muted,fontSize:13,marginBottom:18}}>All cards cleared! {(totalRounds-1)-(game.currentRound||0)} round{(totalRounds-1)-(game.currentRound||0)!==1?"s":""} left.</p>
             <Scoreboard team1={game.team1} team2={game.team2} />
-            <RoundWordAudit logs={game.wordLog||[]} round={game.currentRound||0} />
-            {isAdmin && (game.currentRound||0)<(totalRounds-1) && (
+            <RoundWordAudit logs={game.wordLog||[]} round={game.currentRound||0} team1Name={game.team1.name} team2Name={game.team2.name} />
+            {activeAdmin && (game.currentRound||0)<(totalRounds-1) && (
               <Btn onClick={nextRound} style={{marginTop:18}} disabled={saving}>Start Round {(game.currentRound||0)+2}</Btn>
             )}
           </Card>
@@ -765,8 +1027,8 @@ export default function App() {
                   <div style={{fontFamily:F.display,fontSize:14,color:C.danger,marginTop:10,opacity:0.8}}>{loser} — Rohan is disappointed in you.</div>
                 </div>
               )}
-              <FullGameAudit logs={game.wordLog||[]} totalRounds={totalRounds} />
-              {isAdmin && <Btn onClick={resetGame} color={C.muted} style={{marginTop:18}} disabled={saving}>Reset Game</Btn>}
+              <FullGameAudit logs={game.wordLog||[]} totalRounds={totalRounds} team1Name={game.team1.name} team2Name={game.team2.name} />
+              {activeAdmin && <Btn onClick={resetGame} color={C.muted} style={{marginTop:18}} disabled={saving}>Reset Game</Btn>}
             </Card>
           );
         })()}
